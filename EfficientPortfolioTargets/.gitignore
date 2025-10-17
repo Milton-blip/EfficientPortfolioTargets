@@ -1,0 +1,25 @@
+# .gitignore
+# Confidential / local-only data
+
+# old work
+# should be deleted
+old_files/
+old_output/
+
+# Portfolio Data
+holdings.csv
+portfolio_data/
+
+# Outputs
+outputs/
+portfolio_targets/
+
+# Miscellaneous
+*.pdf
+*.csv
+*.xlsx
+
+# Environment / build artifacts
+.venv/
+__pycache__/
+*.pyc
