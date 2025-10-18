@@ -1,0 +1,54 @@
+Account,Tax_Status,Identifier,Sleeve,Action,Shares_Delta,Price,Delta_$,Realized_CapGain_$
+Fidelity Brokerage,Taxable,SPAXX,Cash,BUY,4697.21,1.0,4697.21,0.0
+Fidelity Brokerage,Taxable,AGG,IG_Core,BUY,673.5,100.18,67467.84,0.0
+Fidelity Brokerage,Taxable,BNDX,IG_Intl_Hedged,BUY,2310.7,49.41,114173.75,0.0
+Fidelity Brokerage,Taxable,91282CCF6,Treasuries,BUY,312.3,98.05,30625.08,0.0
+Fidelity Brokerage,Taxable,SCHV,US_Core,SELL,-11903.1,29.26,-348284.43,-202233.67
+Fidelity Brokerage,Taxable,IVW,US_Growth,BUY,692.2,121.06,83797.01,0.0
+Fidelity Brokerage,Taxable,VTV,US_Value,BUY,253.4,187.53,47523.53,0.0
+Fidelity HSA,HSA,SPAXX,Cash,BUY,795.69,1.0,795.69,0.0
+Fidelity HSA,HSA,AGG,IG_Core,BUY,104.3,100.18,10452.54,0.0
+Fidelity HSA,HSA,BNDX,IG_Intl_Hedged,BUY,358.0,49.41,17688.51,0.0
+Fidelity HSA,HSA,91282CCF6,Treasuries,BUY,48.4,98.05,4744.63,0.0
+Fidelity HSA,HSA,SCHV,US_Core,SELL,-1846.4,29.26,-54026.36,-536065.31
+Fidelity HSA,HSA,IVW,US_Growth,BUY,107.2,121.06,12982.35,0.0
+Fidelity HSA,HSA,VTV,US_Value,BUY,39.3,187.53,7362.64,0.0
+Schwab Brokerage,Taxable,SPAXX,Cash,BUY,37807.16,1.0,37807.16,0.0
+Schwab Brokerage,Taxable,VWO,EM,SELL,-3998.8,54.79,-219091.56,49545.13
+Schwab Brokerage,Taxable,AGG,IG_Core,SELL,-1543.9,100.18,-154667.91,59486.47
+Schwab Brokerage,Taxable,BNDX,IG_Intl_Hedged,BUY,12459.0,49.41,615601.14,0.0
+Schwab Brokerage,Taxable,91282CCF6,Treasuries,SELL,-6223.5,98.05,-610218.48,32642.26
+Schwab Brokerage,Taxable,SCHV,US_Core,SELL,-4408.7,29.26,-128998.09,-327169.63
+Schwab Brokerage,Taxable,IVW,US_Growth,BUY,1679.6,121.06,203330.75,0.0
+Schwab Brokerage,Taxable,VTV,US_Value,BUY,1366.4,187.53,256236.99,0.0
+Vanguard Brokerage,Taxable,SPAXX,Cash,BUY,12981.91,1.0,12981.91,0.0
+Vanguard Brokerage,Taxable,XLE,Energy,SELL,-706.2,88.91,-62785.0,2443.45
+Vanguard Brokerage,Taxable,AGG,IG_Core,BUY,1246.8,100.18,124909.27,0.0
+Vanguard Brokerage,Taxable,BNDX,IG_Intl_Hedged,BUY,2032.1,49.41,100405.25,0.0
+Vanguard Brokerage,Taxable,VPL,Intl_DM,SELL,-2222.1,89.69,-199302.17,60918.87
+Vanguard Brokerage,Taxable,91282CCF6,Treasuries,BUY,578.3,98.05,56698.95,0.0
+Vanguard Brokerage,Taxable,SCHV,US_Core,SELL,-553.8,29.26,-16203.28,-27213.73
+Vanguard Brokerage,Taxable,IVW,US_Growth,BUY,559.9,121.06,67775.94,0.0
+Vanguard Brokerage,Taxable,SCHA,US_SmallValue,SELL,-2503.1,28.26,-70738.46,-302850.07
+Vanguard Brokerage,Taxable,VTV,US_Value,SELL,-73.3,187.53,-13742.43,4565.12
+Vanguard Roth IRA,ROTH IRA,SPAXX,Cash,BUY,21367.96,1.0,21367.96,0.0
+Vanguard Roth IRA,ROTH IRA,VWO,EM,SELL,-4231.7,54.79,-231853.42,231854.84
+Vanguard Roth IRA,ROTH IRA,VWOB,EM_USD,SELL,-3224.8,66.9,-215736.18,215739.12
+Vanguard Roth IRA,ROTH IRA,AGG,IG_Core,BUY,2052.3,100.18,205598.09,0.0
+Vanguard Roth IRA,ROTH IRA,BNDX,IG_Intl_Hedged,BUY,7041.6,49.41,347927.3,0.0
+Vanguard Roth IRA,ROTH IRA,VPL,Intl_DM,SELL,-1965.8,89.69,-176309.82,176312.6
+Vanguard Roth IRA,ROTH IRA,91282CCF6,Treasuries,BUY,951.8,98.05,93325.31,0.0
+Vanguard Roth IRA,ROTH IRA,SCHV,US_Core,SELL,-15191.3,29.26,-444498.8,444497.44
+Vanguard Roth IRA,ROTH IRA,IVW,US_Growth,BUY,2109.4,121.06,255358.76,0.0
+Vanguard Roth IRA,ROTH IRA,VTV,US_Value,BUY,772.3,187.53,144820.79,0.0
+WING Trust,Trust,SPAXX,Cash,BUY,76348.76,1.0,76348.76,0.0
+WING Trust,Trust,VWO,EM,SELL,-11836.3,54.79,-648513.03,-116232.47
+WING Trust,Trust,XLE,Energy,SELL,-3411.7,88.91,-303337.58,17058.5
+WING Trust,Trust,AGG,IG_Core,BUY,7332.9,100.18,734611.8,0.0
+WING Trust,Trust,BNDX,IG_Intl_Hedged,BUY,25160.1,49.41,1243160.87,0.0
+WING Trust,Trust,VPL,Intl_DM,SELL,-3600.4,89.69,-322921.45,211181.46
+WING Trust,Trust,91282CCF6,Treasuries,BUY,3400.9,98.05,333455.79,0.0
+WING Trust,Trust,SCHV,US_Core,SELL,-44170.6,29.26,-1292432.16,-2208.53
+WING Trust,Trust,IVW,US_Growth,BUY,959.0,121.06,116095.79,0.0
+WING Trust,Trust,SCHA,US_SmallValue,SELL,-4886.3,28.26,-138087.62,27363.28
+WING Trust,Trust,VTV,US_Value,BUY,1075.1,187.53,201618.82,0.0
