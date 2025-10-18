@@ -1,2 +1,0 @@
-list_raw_files.sh
-file_list.txt
