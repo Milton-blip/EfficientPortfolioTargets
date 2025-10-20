@@ -367,25 +367,153 @@ def max_sharpe(mu: pd.Series, cov: pd.DataFrame) -> pd.Series:
     w = raw / raw.sum()
     return pd.Series(w, index=mu.index, name="Weight")
 
+# --- replace from here: normalize_inputs, max_return_at_vol, and the call site in main() ---
+
+def normalize_inputs(holdings_sleeve_weights: pd.Series,
+                     returns_by_sleeve: dict[str, pd.Series]) -> tuple[pd.Series, pd.DataFrame]:
+    """
+    Align holdings sleeves with available return series.
+    Returns (mu, cov) with matching index/columns (same sleeve order).
+    If no overlap, write debug file and return empty objects.
+    """
+    # holdings_sleeve_weights: index = sleeves, values = weights (sum to 1 ideally)
+    sleeves_h = pd.Index([str(s) for s in holdings_sleeve_weights.index if pd.notna(s)])
+
+    # stack returns into one DataFrame
+    rets = []
+    for sleeve, s in returns_by_sleeve.items():
+        if s is None:
+            continue
+        s = pd.Series(s).dropna()
+        if s.empty:
+            continue
+        rets.append(pd.DataFrame({"sleeve": str(sleeve), "ret": s}))
+    if not rets:
+        # nothing at all
+        Path("debug_no_overlap.json").write_text(json.dumps({
+            "reason": "no-return-series-available"
+        }, indent=2))
+        return pd.Series(dtype=float), pd.DataFrame()
+
+    R = pd.concat(rets, axis=0).pivot_table(index="ret".index if hasattr(rets[0], "index") else None,
+                                            columns="sleeve", values="ret")
+    # sleeves present in returns
+    sleeves_r = pd.Index([c for c in R.columns if pd.notna(c)])
+
+    # intersection (as strings)
+    sleeves_common = pd.Index(sorted(set(sleeves_h).intersection(set(sleeves_r))))
+    if len(sleeves_common) == 0:
+        dbg = {
+            "holdings_sleeves": list(map(str, sleeves_h)),
+            "returns_sleeves": list(map(str, sleeves_r)),
+            "note": "no-overlap"
+        }
+        Path("debug_no_overlap.json").write_text(json.dumps(dbg, indent=2))
+        return pd.Series(dtype=float), pd.DataFrame()
+
+    # restrict holdings weights and renormalize
+    w = holdings_sleeve_weights.reindex(sleeves_common).fillna(0.0)
+    total = float(w.sum())
+    if total <= 0:
+        # if user holdings all zero after restriction, default to equal weights
+        w = pd.Series(1.0, index=sleeves_common) / len(sleeves_common)
+    else:
+        w = w / total
+
+    # compute mu and cov on overlapping sleeves (align columns)
+    R = R.reindex(columns=sleeves_common).dropna(how="any")
+    mu = R.mean().astype(float)
+    cov = R.cov().astype(float)
+
+    # sanity: index/cols must match
+    cov = cov.reindex(index=sleeves_common, columns=sleeves_common)
+    mu = mu.reindex(sleeves_common)
+
+    return mu, cov
+
 
 def max_return_at_vol(mu: pd.Series, cov: pd.DataFrame, target_vol: float) -> pd.Series:
-    n = len(mu)
-    if not _HAS_CVXPY:
-        return max_sharpe(mu, cov)
+    """
+    Maximize mu^T w subject to w>=0, sum(w)=1, and w^T C w <= target_vol^2.
+    DCP-compliant: uses quad_form <= (target_vol**2)
+    Returns weights as a Series aligned to mu.index.
+    """
+    import cvxpy as cp
+    import numpy as np
+
+    if mu.empty or cov.empty or cov.shape[0] != len(mu):
+        raise ValueError("Inputs are empty or misaligned.")
+
+    sleeves = list(mu.index)
+    C = cov.values.astype(float)
+    n = len(sleeves)
+
+    # Variable
     w = cp.Variable(n)
-    ret = mu.values @ w
-    risk = cp.quad_form(w, cov.values)
-    cons = [cp.sum(w) == 1, w >= 0, cp.sqrt(risk) <= float(target_vol) + 1e-12]
-    prob = cp.Problem(cp.Maximize(ret), cons)
-    try:
-        prob.solve(solver=cp.SCS, verbose=False, max_iters=10000)
-    except Exception:
-        prob.solve(solver=cp.ECOS, verbose=False, max_iters=20000)
-    if w.value is None:
-        raise RuntimeError("No feasible solution at the requested volatility.")
-    wv = np.clip(w.value, 0, None)
-    wv = wv / wv.sum() if wv.sum() > 0 else wv
-    return pd.Series(wv, index=mu.index, name="Weight")
+
+    # Objective
+    obj = cp.Maximize(mu.values @ w)
+
+    # Constraints (long-only, fully invested, volatility cap)
+    cons = [
+        cp.sum(w) == 1,
+        w >= 0,
+        cp.quad_form(w, C) <= float(target_vol) ** 2
+    ]
+
+    prob = cp.Problem(obj, cons)
+
+    # Try a couple solvers; both satisfy DCP here.
+    solved = False
+    for solver in (cp.SCS, cp.ECOS):
+        try:
+            prob.solve(solver=solver, verbose=False, max_iters=20000)
+            if w.value is not None and prob.status in ("optimal", "optimal_inaccurate"):
+                solved = True
+                break
+        except Exception:
+            pass
+
+    if not solved:
+        # Final fallback: let CVXPY pick available solver
+        prob.solve(verbose=False)
+        if w.value is None or prob.status not in ("optimal", "optimal_inaccurate"):
+            raise RuntimeError(f"Optimization failed: status={prob.status}")
+
+    w_np = np.maximum(np.array(w.value, dtype=float), 0.0)
+    if w_np.sum() <= 0:
+        w_np = np.ones(n) / n
+    else:
+        w_np = w_np / w_np.sum()
+
+    return pd.Series(w_np, index=sleeves, name="Weight")
+
+
+# --- In main(), replace just the optimization call block with this safer version ---
+
+# build mu, cov from current holdings + returns
+mu, cov = normalize_inputs(holdings_sleeve_weights, returns_by_sleeve)
+
+if mu.empty or cov.empty:
+    print("[WARN] After normalization, no sleeves overlap between holdings and returns.")
+    print("       Wrote debugging info to debug_no_overlap.json")
+    sys.exit(1)
+
+if args.target_vol is not None:
+    w = max_return_at_vol(mu, cov, float(args.target_vol))
+else:
+    # example: maximum Sharpe or min-var fallback when no target provided
+    w = max_return_at_vol(mu, cov, 0.10)  # pick a default cap if you like
+
+# report using aligned vectors
+expected_ret = float(np.dot(mu.values, w.values))
+risk = float(np.sqrt(np.dot(w.values, np.dot(cov.values, w.values))))
+print(f"Expected Return %: {expected_ret*100:.2f}")
+print(f"Volatility %: {risk*100:.2f}")
+print(f"Sharpe: {expected_ret / max(risk, 1e-12):.2f}")
+print("\nWeights (%):")
+print((w * 100).round(2))
+# --- replace end ---
 
 
 # -------------------------------
