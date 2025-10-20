@@ -1,535 +1,333 @@
-# portfolio_analysis.py
-import pandas as pd, numpy as np
-import matplotlib.pyplot as plt
-from io import StringIO
-import re, yfinance as yf
+#!/usr/bin/env python3
+from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--scenario", type=str, default="Base",
-                    choices=["Base","Reflation","HardLanding","Stagflation","Disinflation","Geopolitical"],
-                    help="5Y macro scenario to adjust expected returns and volatility.")
-parser.add_argument("--target_vol", type=float, default=0.08, help="Annualized volatility target (e.g., 0.08 for 8%%).")
-parser.add_argument("--overlay_all", action="store_true",
-                    help="Plot all macro scenarios on one frontier figure.")
-parser.add_argument("--returns_basis", type=str, default="nominal",
-                    choices=["nominal","real"],
-                    help="Report/optimize in nominal or real terms.")
-parser.add_argument("--inflation", type=float, default=None,
-                    help="Override annual CPI inflation (e.g., 0.025). If not set, scenario defaults are used.")
-args = parser.parse_args()
+import numpy as np
+import pandas as pd
+import cvxpy as cp
 
-# -------------------- LOAD HOLDINGS --------------------
-df = pd.read_csv("holdings.csv")
-df['Value'] = df['Value'].astype(float)
 
-def classify(row):
-    s = str(row['Symbol']).upper()
-    name = str(row['Name']).upper()
-    debt_syms = {'AGG','SCHZ','FBND','BNDX','VWOB','SPAXX','FDRXX','VMFXX'}
-    intl_eq_syms = {'VXUS','VWO','VPL','EMXC','FNDF','FNDE','FNDC'}
-    if s in debt_syms or 'UST' in name or 'TREAS' in name or 'STRIP' in name or 'INFLATION' in name:
-        cat = 'Debt'
-    else:
-        cat = 'Equity'
-    geo = 'International' if (s in intl_eq_syms or 'ADR' in name or 'EMERGING' in name or 'PACIFIC' in name or 'INTERNATIONAL' in name) else 'Domestic'
-    return pd.Series({'Category': cat, 'Geography': geo})
+# ------------------------
+# Sleeve mapping helpers
+# ------------------------
 
-df = pd.concat([df, df.apply(classify, axis=1)], axis=1)
-
-# -------------------- SLEEVE MAPPING --------------------
-map_to_proxy = {
-    'IVW':'US_Growth','VOOG':'US_Growth','AMZN':'US_Growth',
-    'SCHB':'US_Core','DFAU':'US_Core','SCHM':'US_Core',
-    'SCHA':'US_SmallValue','VBR':'US_SmallValue',
-    'IUSV':'US_Value','VTV':'US_Value','VOOV':'US_Value','MGV':'US_Value',
-    'VXUS':'Intl_DM','VPL':'Intl_DM','FNDF':'Intl_DM','FNDC':'Intl_DM',
-    'VWO':'EM','EMXC':'EM','FNDE':'EM','TSM':'EM',
-    'XLE':'Energy','VDE':'Energy',
-    'AGG':'IG_Core','SCHZ':'IG_Core',
-    'VWOB':'EM_USD','BNDX':'IG_Intl_Hedged',
-    'SPAXX':'Cash','FDRXX':'Cash','VMFXX':'Cash'
+MAP_TO_SLEEVE: Dict[str, str] = {
+    # Cash-like
+    "CASH": "Cash", "BIL": "Cash", "SGOV": "Cash", "SPAXX": "Cash",
+    # Treasuries
+    "TLT": "Treasuries", "IEF": "Treasuries", "SHY": "Treasuries",
+    # TIPS
+    "TIP": "TIPS", "SCHP": "TIPS",
+    # EM / Intl
+    "VWO": "EM", "IEMG": "EM", "EEM": "EM",
+    "VEA": "Intl_DM", "IEFA": "Intl_DM", "EFA": "Intl_DM",
+    "EMB": "EM_USD",
+    # US equities
+    "VTI": "US_Core", "ITOT": "US_Core", "SCHB": "US_Core", "VOO": "US_Core", "SPY": "US_Core",
+    "VUG": "US_Growth", "IVW": "US_Growth",
+    "VTV": "US_Value", "IVE": "US_Value",
+    "VBR": "US_SmallValue", "AVUV": "US_SmallValue",
+    # Bonds
+    "AGG": "IG_Core", "BND": "IG_Core",
+    "BNDX": "IG_Intl_Hedged", "IAGG": "IG_Intl_Hedged",
+    # Energy proxy
+    "XLE": "Energy", "VDE": "Energy",
 }
 
-def map_symbol(sym, name):
-    s = str(sym).upper().strip()
+def is_automattic(symbol: str, name: str) -> bool:
+    s = str(symbol).upper()
+    n = str(name).upper()
+    return ("AUTOMATTIC" in n) or (s in {"AUTO", "AUTOM"} and "AUTOMATTIC" in n)
+
+def is_cashlike(symbol: str) -> bool:
+    s = str(symbol).upper()
+    return s in {"CASH", "BIL", "SGOV", "SPAXX"} or s.startswith("CASH")
+
+def infer_sleeve(symbol: str, name: str) -> str:
+    s = str(symbol).upper().strip()
     n = str(name).upper().strip()
-    # Automattic → dedicated illiquid sleeve
-    if s == "AUTOMATTIC" or "AUTOMATTIC" in n:
+
+    if is_automattic(s, n):
         return "Illiquid_Automattic"
-    if s in map_to_proxy:
-        return map_to_proxy[s]
-    if 'UST' in n or 'TREAS' in n or 'STRIP' in n:
-        return 'Treasuries'
-    if 'INFLATION' in n:
-        return 'TIPS'
-    return 'US_Core'
+    if s in MAP_TO_SLEEVE:
+        return MAP_TO_SLEEVE[s]
 
-df['Sleeve'] = [map_symbol(s, n) for s, n in zip(df['Symbol'], df['Name'])]
+    # name keyword fallbacks
+    if any(k in n for k in ["UST", "TREAS", "STRIP", "TREASUR"]):
+        return "Treasuries"
+    if "INFLATION" in n or "TIPS" in n:
+        return "TIPS"
+    if "ENERGY" in n:
+        return "Energy"
+    if any(k in n for k in ["EMERGING", " EM", "EM "]):
+        return "EM"
+    if any(k in n for k in ["DEVELOPED", "INTL", "INTERNATIONAL", "EAFE", "EUROPE", "JAPAN"]):
+        return "Intl_DM"
+    if "SMALL" in n and "VALUE" in n:
+        return "US_SmallValue"
+    if "GROWTH" in n:
+        return "US_Growth"
+    if "VALUE" in n:
+        return "US_Value"
+    if any(k in n for k in ["CORPORATE", "AGGREGATE"]) and any(k in n for k in ["BOND", "FIXED"]):
+        return "IG_Core"
+    if "CASH" in n:
+        return "Cash"
 
-w = df.groupby('Sleeve')['Value'].sum()
-w = w / w.sum()
+    return "US_Core"  # safe default
 
-# ---- Illiquid carve-out: keep Automattic weight fixed, optimize only on the rest ----
-w_ill = float(w.get("Illiquid_Automattic", 0.0))
-investable = [s for s in w.index if s != "Illiquid_Automattic"]
-w_opt = (w[investable] / max(1e-12, (1.0 - w_ill))).copy()
 
-# Helper to merge Automattic back later
-def merge_back(weights_series):
-    """
-    weights_series: pd.Series over investable sleeves summing to 1
-    returns pd.Series over investable + Illiquid_Automattic summing to 1
-    """
-    out = (1.0 - w_ill) * weights_series
-    if w_ill > 0:
-        out = out.copy()
-        out.loc["Illiquid_Automattic"] = w_ill
+# ------------------------
+# IO: holdings & returns
+# ------------------------
+
+def _lower_map(columns: List[str]) -> Dict[str, str]:
+    return {c.lower(): c for c in columns}
+
+def _has(cols: Dict[str, str], name: str) -> bool:
+    return name.lower() in cols
+
+def _col(cols: Dict[str, str], name: str) -> str:
+    return cols[name.lower()]
+
+def read_holdings(path: str) -> pd.DataFrame:
+    f = Path(path)
+    if not f.exists():
+        raise SystemExit(f"[ERROR] Holdings file not found: {path}")
+    df = pd.read_csv(f)
+
+    cols = _lower_map(df.columns)
+
+    # Required base fields
+    for need in ["symbol", "name", "quantity"]:
+        if not _has(cols, need):
+            raise SystemExit(f"[ERROR] Holdings missing required column: {need!r}")
+
+    sym = _col(cols, "symbol")
+    nam = _col(cols, "name")
+    qty = _col(cols, "quantity")
+
+    # Optional price/value fields under multiple possible names
+    price = None
+    for cand in ["pricepershare", "price"]:
+        if _has(cols, cand):
+            price = _col(cols, cand)
+            break
+
+    mv = None
+    for cand in ["marketvalue", "market_value", "value", "market value"]:
+        if _has(cols, cand):
+            mv = _col(cols, cand)
+            break
+
+    sleeve_col = _col(cols, "sleeve") if _has(cols, "sleeve") else None
+
+    out = pd.DataFrame({
+        "Symbol": df[sym].astype(str),
+        "Name": df[nam].astype(str),
+        "Quantity": pd.to_numeric(df[qty], errors="coerce").fillna(0.0),
+    })
+
+    out["Price"] = pd.to_numeric(df[price], errors="coerce") if price else np.nan
+    out["MarketValue"] = pd.to_numeric(df[mv], errors="coerce") if mv else np.nan
+
+    # derive Price from MV/Qty when needed
+    need_price = out["Price"].isna() & out["Quantity"].gt(0)
+    out.loc[need_price, "Price"] = out.loc[need_price, "MarketValue"] / out.loc[need_price, "Quantity"]
+
+    # derive MV from Qty*Price when needed
+    need_mv = out["MarketValue"].isna()
+    out.loc[need_mv, "MarketValue"] = out.loc[need_mv, "Quantity"] * out.loc[need_mv, "Price"]
+
+    # ensure sleeve dtype object (prevents pandas warnings on mixed types)
+    out["Sleeve"] = pd.Series(index=out.index, dtype="object")
+    if sleeve_col is not None:
+        raw = df[sleeve_col].astype("string")
+        raw = raw.where(~raw.isna(), None)
+        out.loc[:, "Sleeve"] = raw
+
+    # fill missing sleeves via inference
+    mask_missing = out["Sleeve"].isna() | (out["Sleeve"].astype(str).str.strip() == "")
+    if mask_missing.any():
+        inferred = [
+            infer_sleeve(s, n) if mm else sv
+            for s, n, sv, mm in zip(out["Symbol"], out["Name"], out["Sleeve"], mask_missing)
+        ]
+        out["Sleeve"] = pd.Series(inferred, index=out.index, dtype="object")
+
+    # normalize obvious cash
+    cash_mask = out["Symbol"].map(is_cashlike)
+    out.loc[cash_mask, "Sleeve"] = "Cash"
+
+    # drop empties
+    out = out[(out["Quantity"].abs() > 0) | (out["MarketValue"].abs() > 0)].copy()
+    out["MarketValue"] = out["MarketValue"].fillna(0.0)
+    out["Price"] = out["Price"].fillna(0.0)
+
     return out
 
 
-# -------------------- DOWNLOAD RETURNS --------------------
-def is_yf_symbol(s):
-    if s.upper() in {"SPAXX","VMFXX","FDRXX","912810TP#"}: return False
-    if re.fullmatch(r"[0-9]{6,}", s): return False
-    return True
+def read_returns(path: str) -> pd.DataFrame:
+    f = Path(path)
+    if not f.exists():
+        raise SystemExit(
+            "[ERROR] Could not find returns file.\n"
+            "Place a CSV like:\n"
+            "  returns/sleeve_returns.csv\n"
+            "with columns: Date,<sleeve1>,<sleeve2>,...\n"
+            "Each column should be period returns (e.g., monthly decimal returns)."
+        )
+    r = pd.read_csv(f)
+    if r.empty or r.shape[1] < 2:
+        raise SystemExit("[ERROR] Returns file must have a Date column and at least one sleeve column.")
+    r = r.dropna(how="all")
+    r = r.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").dropna(how="all")
+    r = r.dropna(axis=1, how="all")
+    return r
 
-def load_prices(tickers, start="2015-01-01"):
-    raw = yf.download(
-        tickers=list(tickers),
-        start=start,
-        auto_adjust=True,
-        progress=False,
-        group_by="ticker",
-        threads=True
+
+# ------------------------
+# Optimization building blocks
+# ------------------------
+
+def normalize_inputs(holdings_sleeve_value: pd.Series, returns_by_sleeve: pd.DataFrame
+                     ) -> Tuple[pd.Series, pd.DataFrame, pd.Series]:
+    hv = holdings_sleeve_value.groupby(level=0).sum()  # index: Sleeve
+    hv = hv[hv > 0]
+    if hv.empty:
+        raise SystemExit("[ERROR] No positive MarketValue sleeves in holdings.")
+
+    hv_w = hv / hv.sum()
+
+    sleeves_h = set(hv_w.index.astype(str))
+    sleeves_r = set(returns_by_sleeve.columns.astype(str))
+    overlap = sorted(sleeves_h & sleeves_r)
+
+    if not overlap:
+        Path("debug_no_overlap.json").write_text(json.dumps({
+            "holdings_sleeves": sorted(sleeves_h),
+            "returns_sleeves": sorted(sleeves_r),
+        }, indent=2))
+        raise SystemExit("[WARN] After normalization, no sleeves overlap between holdings and returns.\n"
+                         "       Wrote debugging info to debug_no_overlap.json")
+
+    R = returns_by_sleeve[overlap].copy()
+    mu = R.mean(axis=0)
+    cov = R.cov()
+    hv_w = hv_w.reindex(overlap).fillna(0.0)
+    return mu, cov, hv_w
+
+
+def max_return_at_vol(
+    mu: pd.Series,
+    cov: pd.DataFrame,
+    target_vol: float,
+    w0: pd.Series | None = None,
+    w_min: float = 0.0,
+    w_max: float = 1.0,
+    l2_to_current: float = 0.0,
+) -> pd.Series:
+    sleeves = list(mu.index)
+    n = len(sleeves)
+    if n == 0:
+        raise SystemExit("[ERROR] No sleeves available for optimization.")
+
+    w = cp.Variable(n)
+    Sigma = cov.reindex(index=sleeves, columns=sleeves).values
+
+    constraints = [
+        cp.sum(w) == 1,
+        w >= w_min,
+        w <= w_max,
+        cp.quad_form(w, Sigma) <= target_vol ** 2,
+    ]
+
+    if w0 is None:
+        w0v = np.zeros(n)
+    else:
+        w0v = w0.reindex(sleeves).fillna(0.0).values
+
+    # concave objective: maximize mu·w - α||w - w0||²
+    objective = cp.Maximize(mu.reindex(sleeves).values @ w - l2_to_current * cp.sum_squares(w - w0v))
+
+    prob = cp.Problem(objective, constraints)
+    prob.solve(solver=cp.SCS, verbose=False, max_iters=30000)
+    if prob.status not in {"optimal", "optimal_inaccurate"}:
+        prob.solve(solver=cp.ECOS, verbose=False, max_iters=30000)
+    if prob.status not in {"optimal", "optimal_inaccurate"}:
+        raise SystemExit(f"[ERROR] Solver failed: {prob.status}")
+
+    sol = pd.Series(np.array(w.value).reshape(-1), index=sleeves).clip(lower=0)
+    sol = sol / sol.sum() if sol.sum() > 0 else sol
+    return sol
+
+
+# ------------------------
+# Reporting helpers
+# ------------------------
+
+def print_results(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame) -> None:
+    mu_a = mu.reindex(weights.index).fillna(0.0).values
+    cov_a = cov.reindex(index=weights.index, columns=weights.index).values
+    exp_ret = float(mu_a @ weights.values)
+    vol = float(np.sqrt(weights.values @ cov_a @ weights.values))
+    sharpe = exp_ret / vol if vol > 0 else np.nan
+
+    print("\nWeights (%):")
+    print((weights * 100).round(2).sort_values(ascending=False).to_frame("Weight%"))
+
+    print(f"\nExpected Return %: {(exp_ret*100):.2f}")
+    print(f"Volatility %: {(vol*100):.2f}")
+    print(f"Sharpe: {sharpe:.2f}")
+
+    mu_sorted = mu.sort_values(ascending=False) * 100
+    print("\nMean period returns by sleeve (%), descending:")
+    print(mu_sorted.round(3))
+
+
+# ------------------------
+# CLI
+# ------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Efficient portfolio sleeve optimizer (sleeve targets).")
+    p.add_argument("--holdings", required=True, help="Path to holdings CSV.")
+    p.add_argument("--returns-file", default="returns/sleeve_returns.csv", help="CSV of sleeve returns (Date,<sleeves...>).")
+    p.add_argument("--target-vol", type=float, required=True, help="Target volatility as decimal (e.g. 0.08 for 8%%).")
+    p.add_argument("--max-weight", type=float, default=1.0, help="Per-sleeve upper bound (e.g. 0.35).")
+    p.add_argument("--min-weight", type=float, default=0.0, help="Per-sleeve lower bound.")
+    p.add_argument("--l2-to-current", type=float, default=0.0, help="Penalty toward current sleeve weights (e.g. 0.05).")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    holdings = read_holdings(args.holdings)
+
+    illq = holdings.loc[holdings["Sleeve"] == "Illiquid_Automattic", "MarketValue"].sum()
+    if illq > 0:
+        print(f"[NOTE] Excluding sleeves with no return history from stats: ['Illiquid_Automattic']")
+
+    sleeves_series = holdings.set_index("Sleeve")["MarketValue"]
+
+    R = read_returns(args.returns_file)
+    mu, cov, cur_w = normalize_inputs(sleeves_series, R)
+
+    w_opt = max_return_at_vol(
+        mu, cov, float(args.target_vol),
+        w0=cur_w,
+        w_min=float(args.min_weight),
+        w_max=float(args.max_weight),
+        l2_to_current=float(args.l2_to_current),
     )
 
-    if isinstance(raw.columns, pd.MultiIndex):
-        close = raw.loc[:, (slice(None), "Close")]
-        close.columns = close.columns.get_level_values(0)
-    else:
-        if "Close" not in raw.columns:
-            raise ValueError("No 'Close' column found.")
-        close = raw["Close"].to_frame()
-        close.columns = list(tickers)[:1]
+    print_results(w_opt, mu, cov)
 
-    close = close.dropna(axis=1, how="all").ffill().dropna(how="any", axis=0)
-    return close
 
-proxy_tickers = {
-    'US_Core':'SCHB','US_Value':'VTV','US_SmallValue':'VBR','US_Growth':'IVW',
-    'Intl_DM':'VXUS','EM':'VWO','Energy':'XLE',
-    'IG_Core':'AGG','Treasuries':'IEF','TIPS':'TIP',
-    'EM_USD':'VWOB','IG_Intl_Hedged':'BNDX','Cash':'BIL'
-}
-
-tickers = list({proxy_tickers[k] for k in w.index if k in proxy_tickers})
-tickers = [t for t in tickers if is_yf_symbol(t)]
-
-px = load_prices(tickers, start="2015-01-01")
-rets = px.resample('ME').last().pct_change().dropna()
-
-name_from_ticker = {v: k for k, v in proxy_tickers.items()}
-rets = rets.rename(columns=name_from_ticker)
-
-# ----- investable universe (exclude Automattic sleeve) -----
-investable = [s for s in rets.columns if s != "Illiquid_Automattic"]
-
-# align weights: keep only investable sleeves, renormalize to 1 over investable piece
-w_inv = (w_opt.reindex(investable).fillna(0.0)).copy()
-w_inv /= max(1e-12, w_inv.sum())
-
-# align returns to investable sleeves
-rets_inv = rets[investable].copy()
-
-# ----- Scenario-adjusted expected returns (mu_scn) and covariance scaling -----
-# Baseline historical means
-mu_hist = rets.mean() * 12  # annualized
-# Per-sleeve add-ons to expected return (annual, absolute)
-SCENARIO_MU_ADD = {
-    "Base":         {"all": 0.00},
-    "Disinflation": {"US_Growth": 0.01, "US_Core": 0.006, "US_Value": 0.004, "Intl_DM": 0.004,
-                     "EM": 0.006, "IG_Core": 0.002, "Treasuries": 0.001, "TIPS": -0.002, "Energy": -0.005},
-    "Reflation":    {"Energy": 0.030, "EM": 0.020, "TIPS": 0.015, "US_Value": 0.008, "US_Core": 0.004,
-                     "US_Growth": 0.000, "IG_Core": -0.010, "Treasuries": -0.015},
-    "HardLanding":  {"US_Growth": -0.030, "US_Core": -0.020, "US_Value": -0.020, "Intl_DM": -0.020,
-                     "EM": -0.035, "Energy": -0.020, "IG_Core": 0.005, "Treasuries": 0.010, "TIPS": -0.005},
-    "Stagflation":  {"US_Growth": -0.025, "US_Core": -0.015, "US_Value": -0.010, "Intl_DM": -0.010,
-                     "EM": 0.005, "Energy": 0.020, "IG_Core": -0.015, "Treasuries": -0.020, "TIPS": 0.015},
-    "Geopolitical": {"US_Growth": -0.015, "US_Core": -0.010, "US_Value": -0.008, "Intl_DM": -0.015,
-                     "EM": -0.020, "Energy": 0.010, "IG_Core": 0.000, "Treasuries": 0.005, "TIPS": 0.006}
-}
-# Covariance (vol) multipliers by scenario (applied to Sigma AFTER shrinkage)
-SCENARIO_VOL_MULT = {
-    "Base": 1.00, "Disinflation": 0.95, "Reflation": 1.05, "HardLanding": 1.25, "Stagflation": 1.30, "Geopolitical": 1.20
-}
-# Annual CPI assumptions by scenario (used when --returns_basis=real)
-SCENARIO_INFL = {
-    "Base": 0.025,
-    "Disinflation": 0.018,
-    "Reflation": 0.035,
-    "HardLanding": 0.020,
-    "Stagflation": 0.045,
-    "Geopolitical": 0.030,
-}
-
-# Build mu_scn by adding sleeve-specific adjustments (missing keys get 0)
-mu_scn = mu_hist.copy()
-adds = SCENARIO_MU_ADD.get(args.scenario, {"all": 0.00})
-base_add = adds.get("all", 0.0)
-mu_scn = mu_scn + base_add
-for k, v in adds.items():
-    if k == "all": continue
-    if k in mu_scn.index:
-        mu_scn[k] += v
-
-# Optional clamp to avoid unrealistic inputs
-mu_scn = mu_scn.clip(lower=-0.05, upper=0.18)
-
-# Stash for downstream frontier code
-MU_FOR_FRONTIER = mu_scn
-VOL_MULT_FOR_FRONTIER = SCENARIO_VOL_MULT.get(args.scenario, 1.00)
-
-# ----- Real vs Nominal handling -----
-infl_used = args.inflation if args.inflation is not None else SCENARIO_INFL.get(args.scenario, 0.025)
-if args.returns_basis == "real":
-    MU_FOR_FRONTIER = MU_FOR_FRONTIER - infl_used
-BASIS_LABEL = "Real" if args.returns_basis == "real" else "Nominal"
-
-# ---- Risk-free handling (nominal vs real) ----
-RF_NOMINAL = 0.035
-RF_USED = RF_NOMINAL if args.returns_basis == "nominal" else ( (1+RF_NOMINAL)/(1+infl_used) - 1.0 )
-
-mu = rets.mean() * 12
-cov = rets.cov() * 12
-
-# Align stats to sleeves that actually have return history
-common_idx = w.index.intersection(mu.index)
-if len(common_idx) < len(w.index):
-    missing = [x for x in w.index if x not in mu.index]
-    print("[NOTE] Excluding sleeves with no return history from stats:", missing)
-
-mu = mu.reindex(common_idx)
-cov = cov.reindex(index=common_idx, columns=common_idx)
-w_stats = w.reindex(common_idx).fillna(0.0)
-
-port_mu = float(mu @ w_stats)
-port_sig = float(np.sqrt(w_stats @ cov.values @ w_stats))
-sharpe = (port_mu - RF_USED) / port_sig if port_sig > 0 else float("nan")
-
-print("Weights (%):"); print((100*w).round(2))
-print(f"\nExpected Return %: {port_mu*100:.2f}")
-print(f"Volatility %: {port_sig*100:.2f}")
-print(f"Sharpe: {sharpe:.2f}")
-print("\nCorrelation matrix:"); print(rets.corr().round(2))
-
-
-
-# -------- Efficient Frontier (cvxpy) with realistic constraints --------
-import numpy as np, pandas as pd, cvxpy as cp
-from sklearn.covariance import LedoitWolf
-import matplotlib.pyplot as plt
-
-
-# === inputs for optimizer (investable only) ===
-tickers = investable
-n = len(tickers)
-
-# scenario-adjusted expected returns, investable only
-mu = MU_FOR_FRONTIER.reindex(tickers).astype(float)
-
-# Ledoit–Wolf covariance on investable sleeves; apply scenario vol multiplier
-from sklearn.covariance import LedoitWolf
-Sigma = pd.DataFrame(LedoitWolf().fit(rets_inv.values).covariance_,
-                     index=tickers, columns=tickers) * 12.0
-Sigma *= (VOL_MULT_FOR_FRONTIER ** 2)
-eps = 1e-8
-Sigma_v = Sigma.values + eps*np.eye(n)
-
-# current investable weights (sum to 1 over investable)
-w_cur = w_inv.reindex(tickers).fillna(0.0).values
-
-# bounds for investable sleeves only
-ub = pd.Series(0.40, index=tickers)
-lb = pd.Series(0.00, index=tickers)
-if "Cash" in ub.index:
-    ub["Cash"] = max(float(w.get("Cash", 0.0)), 0.02)
-for s in ["Energy"]:
-    if s in ub.index: ub[s] = 0.08
-for s in ["US_Growth","US_Core","US_Value","US_SmallValue"]:
-    if s in ub.index: ub[s] = 0.45
-for s in ["IG_Core","Treasuries","TIPS","IG_Intl_Hedged","EM_USD"]:
-    if s in ub.index:
-        lb[s] = 0.00
-        ub[s] = min(ub[s], 0.35)
-if "EM" in ub.index:
-    ub["EM"] = min(ub["EM"], 0.15)
-
-LB = lb.reindex(tickers).fillna(0).values
-UB = ub.reindex(tickers).fillna(0.40).values
-
-def stats_investable(wts):
-    er = float(mu.values @ wts)
-    vol = float(np.sqrt(wts @ Sigma_v @ wts))
-    sh = (er - RF_USED)/vol if vol > 0 else np.nan
-    return er, vol, sh
-
-# --- Max-Sharpe (SOC) on investable only ---
-import cvxpy as cp
-w_ms = cp.Variable(n)
-s = cp.Variable()
-cons_ms = [
-    (mu.values - RF_USED) @ w_ms >= s,
-    cp.quad_form(w_ms, Sigma_v) <= 1.0,
-    cp.sum(w_ms) == 1.0,
-    w_ms >= LB,
-    w_ms <= UB
-]
-cp.Problem(cp.Maximize(s), cons_ms).solve(solver=cp.ECOS, max_iters=30000)
-
-# --- Min-Vol on investable only ---
-w_mv = cp.Variable(n)
-cp.Problem(cp.Minimize(cp.quad_form(w_mv, Sigma_v)),
-           [cp.sum(w_mv)==1.0, w_mv>=LB, w_mv<=UB]).solve(solver=cp.ECOS, max_iters=30000)
-
-w_ms_v = np.array(w_ms.value).flatten()
-w_mv_v = np.array(w_mv.value).flatten()
-
-# ---- Automattic-aware helpers (investable-only optimize, then merge back) ----
-ILLQ = "Illiquid_Automattic"   # must already exist in your lists if present
-A_W = float(w.get(ILLQ, 0.0)) if ILLQ in w.index else 0.0
-
-def merge_back(w_investable: pd.Series) -> pd.Series:
-    """Return full-sleeve weights including Automattic fixed at A_W."""
-    full = w_investable.reindex(tickers).fillna(0.0).copy()
-    if ILLQ in rets.columns:
-        # scale investable to (1 - A_W), set Automattic weight to A_W
-        full *= (1.0 - A_W)
-        full = full.reindex(rets.columns).fillna(0.0)
-        full[ILLQ] = A_W
-    return full
-
-def report_stats(w_full: pd.Series):
-    """Compute ER/Vol/Sharpe for full portfolio with Automattic assumed 0 ER/Vol."""
-    # start from investable inputs
-    mu_i = MU_FOR_FRONTIER.reindex(tickers).fillna(0.0).values
-    Sig_i = Sigma_v  # investable covariance matrix (n x n)
-
-    # split weights
-    if ILLQ in w_full.index:
-        A = float(w_full.get(ILLQ, 0.0))
-    else:
-        A = 0.0
-    w_i = w_full.reindex(tickers).fillna(0.0).values
-    # ER and Var for investable part
-    er_i = float(mu_i @ w_i)
-    var_i = float(w_i @ Sig_i @ w_i)
-    # Automattic contribution assumed 0 ER and 0 Var -> no cross terms (conservative)
-    er_full = er_i
-    vol_full = var_i ** 0.5
-    sh = (er_full - RF_USED) / vol_full if vol_full > 0 else np.nan
-    return er_full, vol_full, sh
-
-# Build "current / max-sharpe / min-vol" FULL portfolios (Automattic fixed)
-w_cur_full = merge_back(w.reindex(tickers).fillna(0.0))
-w_ms_full  = merge_back(pd.Series(w_ms_v, index=tickers))
-w_mv_full  = merge_back(pd.Series(w_mv_v, index=tickers))
-
-# 6) Smooth frontier curve (optimize investable only), then merge Automattic back
-gammas = np.geomspace(1e-1, 5e2, 60)  # higher γ → lower risk
-vols_full, ers_full = [], []
-
-for g in gammas:
-    w_g = cp.Variable(n)
-    prob_g = cp.Problem(
-        cp.Minimize(g*cp.quad_form(w_g, Sigma_v) - mu.values @ w_g),
-        [cp.sum(w_g)==1.0, w_g>=LB, w_g<=UB]
-    )
-    prob_g.solve(solver=cp.ECOS, max_iters=20000)
-    wv = np.array(w_g.value).flatten()
-    w_full = merge_back(pd.Series(wv, index=tickers))
-    er_f, vol_f, _ = report_stats(w_full)
-    ers_full.append(er_f); vols_full.append(vol_f)
-
-# 7) Report + plot using FULL stats (Automattic held constant)
-mu_c, vol_c, sh_c = report_stats(w_cur_full)
-mu_ms, vol_ms, sh_ms = report_stats(w_ms_full)
-mu_mv, vol_mv, sh_mv = report_stats(w_mv_full)
-
-print("\nEfficient Frontier (annualized, constrained; Automattic held constant):")
-print(f"Current   : ER={mu_c*100:.2f}%, Vol={vol_c*100:.2f}%, Sharpe={sh_c:.2f}")
-print(f"MaxSharpe : ER={mu_ms*100:.2f}%, Vol={vol_ms*100:.2f}%, Sharpe={sh_ms:.2f}")
-print(f"MinVol    : ER={mu_mv*100:.2f}%, Vol={vol_mv*100:.2f}%, Sharpe={sh_mv:.2f}")
-
-# Export full weights (includes Automattic as fixed)
-alloc_full = pd.DataFrame({
-    "Current":  w_cur_full,
-    "MaxSharpe": w_ms_full,
-    "MinVol":    w_mv_full
-}).fillna(0.0)
-alloc_full.to_csv(f"allocations_frontier_{args.scenario}_{BASIS_LABEL}.csv")
-
-# Sleeve ER/Vol table (Automattic shown with 0/0 under our assumption)
-stats_df = pd.DataFrame({
-    "ER_%":  (MU_FOR_FRONTIER.reindex(alloc_full.index).fillna(0.0)*100).round(2),
-    "Vol_%": 0.0
-}, index=alloc_full.index)
-
-# For investable sleeves, show their standalone vols from Sigma_v
-standalone_vol = pd.Series(np.sqrt(np.diag(Sigma_v))*100, index=tickers)
-stats_df.loc[standalone_vol.index, "Vol_%"] = standalone_vol.round(2)
-# Ensure Automattic is 0
-if ILLQ in stats_df.index:
-    stats_df.loc[ILLQ, "Vol_%"] = 0.00
-
-stats_df.to_csv(f"sleeve_ERVol_{args.scenario}_{BASIS_LABEL}.csv")
-
-plt.figure(figsize=(6.8,4.4))
-plt.plot(np.array(vols_full)*100, np.array(ers_full)*100, color="navy", lw=2, label="Frontier (Automattic fixed)")
-plt.scatter(vol_c*100,  mu_c*100,  c="red",   label="Current",   zorder=3)
-plt.scatter(vol_ms*100, mu_ms*100, c="green", label="MaxSharpe", zorder=3)
-plt.scatter(vol_mv*100, mu_mv*100, c="blue",  label="MinVol",    zorder=3)
-plt.xlabel("Volatility (%)"); plt.ylabel(f"Expected Return (%) — {BASIS_LABEL}")
-plt.title(f"Efficient Frontier (Constrained, {args.scenario}, {BASIS_LABEL}; Automattic fixed)")
-plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout()
-plt.savefig(f"frontier_cvxpy_constrained_{args.scenario}_{BASIS_LABEL}.png", dpi=150)
-plt.show()
-
-
-
-
-# (plot using the Automattic-aware frontier arrays we built above)
-plt.figure(figsize=(6.8,4.4))
-plt.plot(np.array(vols_full)*100, np.array(ers_full)*100, color="navy", lw=2, label="Frontier (Automattic fixed)")
-plt.scatter(vol_c*100,  mu_c*100,  c="red",   label="Current",   zorder=3)
-plt.scatter(vol_ms*100, mu_ms*100, c="green", label="MaxSharpe", zorder=3)
-plt.scatter(vol_mv*100, mu_mv*100, c="blue",  label="MinVol",    zorder=3)
-plt.xlabel("Volatility (%)"); plt.ylabel(f"Expected Return (%) — {BASIS_LABEL}")
-plt.title(f"Efficient Frontier (Constrained, {args.scenario}, {BASIS_LABEL}; Automattic fixed)")
-plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout()
-plt.savefig(f"frontier_cvxpy_constrained_{args.scenario}_{BASIS_LABEL}.png", dpi=150)
-plt.show()
-
-# Sleeve ER/Vol for sanity
-stats_df = pd.DataFrame({
-    "ER_%": (mu*100).round(2),
-    "Vol_%": (np.sqrt(np.diag(Sigma_v))*100).round(2)
-})
-print("\nSleeve ER/Vol (annualized):")
-print(stats_df)
-
-
-
-
-# -------- Target Volatility Portfolio (8%) --------
-target_vol = 0.08  # 8% annual volatility target
-
-w_t = cp.Variable(n)
-constraints_t = [
-    cp.sum(w_t) == 1.0,
-    w_t >= LB,
-    w_t <= UB
-]
-prob_t = cp.Problem(cp.Maximize(mu.values @ w_t),
-                    constraints_t + [cp.quad_form(w_t, Sigma_v) <= target_vol**2])
-prob_t.solve(solver=cp.ECOS, max_iters=30000)
-
-w_tgt = np.array(w_t.value).flatten()
-er_tgt, vol_tgt, sh_tgt = stats_investable(w_tgt)
-
-print("\nTarget Volatility Portfolio (8% annualized):")
-print(f"Expected Return: {er_tgt*100:.2f}%")
-print(f"Volatility:      {vol_tgt*100:.2f}%")
-print(f"Sharpe Ratio:    {sh_tgt:.2f}")
-
-
-plt.figure(figsize=(6.5,4.3))
-plt.plot(np.array(vols_full)*100, np.array(ers_full)*100, color="navy", lw=1.5, label="Frontier (Automattic fixed)")
-plt.scatter(vol_tgt*100, er_tgt*100, c="gold", s=100, label="Target 8% Vol", edgecolors="black")
-plt.scatter(vol_c*100,  mu_c*100,  c="red",   label="Current",   zorder=3)
-plt.scatter(vol_ms*100, mu_ms*100, c="green", label="MaxSharpe", zorder=3)
-plt.scatter(vol_mv*100, mu_mv*100, c="blue",  label="MinVol",    zorder=3)
-plt.xlabel("Volatility (%)"); plt.ylabel("Expected Return (%)")
-plt.title(f"Efficient Frontier + {int(target_vol*100)}% Target ({args.scenario}, {BASIS_LABEL})")
-plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout()
-plt.savefig(f"frontier_targetVol{int(target_vol*100)}_{args.scenario}_{BASIS_LABEL}.png", dpi=150)
-pd.DataFrame({"Weight": w_tgt}, index=tickers).to_csv(f"allocation_targetVol_{int(target_vol*100)}_{args.scenario}_{BASIS_LABEL}.csv")
-plt.show()
-
-
-# ========= Overlay all scenarios on one plot =========
-if args.overlay_all:
-    import matplotlib.pyplot as plt
-    import cvxpy as cp
-    import numpy as np
-    import pandas as pd
-    try:
-        from sklearn.covariance import LedoitWolf
-        def shrink_cov(X):  # monthly -> annualized
-            return pd.DataFrame(LedoitWolf().fit(X).covariance_,
-                                index=rets.columns, columns=rets.columns) * 12.0
-    except Exception:
-        # Fallback diagonal-target shrinkage (no sklearn)
-        def shrink_cov(X):
-            S = np.cov(X.T, bias=False)          # monthly sample cov
-            a = 0.25                              # shrinkage intensity
-            F = np.diag(np.diag(S))
-            Sig = ((1 - a) * S + a * F) * 12.0   # annualize
-            return pd.DataFrame(Sig, index=rets.columns, columns=rets.columns)
-
-    def build_mu_sigma(scn: str):
-        mu_hist = rets.mean() * 12.0
-        adds = SCENARIO_MU_ADD.get(scn, {"all": 0.0})
-        base_add = adds.get("all", 0.0)
-        mu = (mu_hist + base_add).copy()
-        for k, v in adds.items():
-            if k == "all": continue
-            if k in mu.index: mu[k] += v
-        mu = mu.clip(-0.05, 0.18)
-        Sigma = shrink_cov(rets.values)
-        mult = SCENARIO_VOL_MULT.get(scn, 1.0)
-        Sigma *= (mult ** 2)
-        Sig_v = Sigma.values + 1e-8 * np.eye(len(Sigma))
-        return mu, Sigma, Sig_v
-
-    tickers = rets.columns.tolist()
-    n = len(tickers)
-    LB = pd.Series(0.0, index=tickers)
-    UB = pd.Series(0.40, index=tickers)
-    if "Cash" in tickers: UB["Cash"] = max(float(w.get("Cash", 0.0)), 0.02)
-    for s in ["Energy"]:
-        if s in UB.index: UB[s] = 0.08
-    for s in ["US_Growth","US_Core","US_Value","US_SmallValue"]:
-        if s in UB.index: UB[s] = 0.45
-    for s in ["IG_Core","Treasuries","TIPS","IG_Intl_Hedged","EM_USD"]:
-        if s in UB.index: UB[s] = min(UB[s], 0.35)
-    if "EM" in UB.index: UB["EM"] = min(UB.get("EM", 0.40), 0.15)
-    LB = LB.values; UB = UB.values
-
-    scenarios = ["Base","Disinflation","Reflation","HardLanding","Stagflation","Geopolitical"]
-    colors = {"Base":"#1f77b4","Disinflation":"#2ca02c","Reflation":"#d62728",
-              "HardLanding":"#9467bd","Stagflation":"#ff7f0e","Geopolitical":"#17becf"}
-
-    plt.figure(figsize=(7.2,4.6))
-    for scn in scenarios:
-        mu_s, Sigma_s, Sig_v = build_mu_sigma(scn)
-        # risk-aversion sweep → smooth frontier under bounds
-        gammas = np.geomspace(1e-1, 5e2, 70)
-        vols, ers = [], []
-        for g in gammas:
-            w_g = cp.Variable(n)
-            cons = [cp.sum(w_g)==1.0, w_g >= LB, w_g <= UB]
-            obj  = cp.Minimize(g*cp.quad_form(w_g, Sig_v) - mu_s.values @ w_g)
-            cp.Problem(obj, cons).solve(solver=cp.ECOS, max_iters=20000)
-            wv = np.array(w_g.value).flatten()
-            er = float(mu_s.values @ wv)
-            vol = float(np.sqrt(wv @ Sig_v @ wv))
-            ers.append(er); vols.append(vol)
-        plt.plot(np.array(vols)*100, np.array(ers)*100, color=colors[scn], lw=2, label=scn)
-
-    plt.xlabel("Volatility (%)"); plt.ylabel("Expected Return (%)")
-    plt.title(f"Efficient Frontiers by 5Y Macro Scenario ({BASIS_LABEL})")
-    plt.legend(ncol=2, fontsize=9); plt.grid(True, alpha=0.3); plt.tight_layout()
-    plt.savefig(f"frontier_overlay_all_scenarios_{BASIS_LABEL}.png", dpi=150)
-    plt.show()
+if __name__ == "__main__":
+    main()
