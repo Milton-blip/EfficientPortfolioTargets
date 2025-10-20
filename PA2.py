@@ -127,6 +127,102 @@ def load_holdings(path: str | Path) -> pd.DataFrame:
     if df.empty:
         sys.exit("[ERROR] holdings CSV is empty.")
 
+        # --- Sleeve normalization & inference ---
+
+        SLEEVE_ALIASES = {
+            "US CORE": "US_Core", "US-CORE": "US_Core", "US_CORE": "US_Core", "CORE_US": "US_Core",
+            "CORE US": "US_Core",
+            "US VALUE": "US_Value", "US-VALUE": "US_Value", "US_VALUE": "US_Value",
+            "US GROWTH": "US_Growth", "US-GROWTH": "US_Growth", "US_GROWTH": "US_Growth",
+            "US SMALL VALUE": "US_SmallValue", "US SMALLVALUE": "US_SmallValue", "US_SMALL_VALUE": "US_SmallValue",
+            "US-SMALL-VALUE": "US_SmallValue",
+            "INTL DM": "Intl_DM", "INTL_DM": "Intl_DM", "INTERNATIONAL DM": "Intl_DM",
+            "INTL-DEVELOPED": "Intl_DM", "DEVELOPED EX-US": "Intl_DM",
+            "EM USD": "EM_USD", "EM_USD": "EM_USD", "EM (USD)": "EM_USD",
+            "EM": "EM", "EMERGING": "EM",
+            "IG CORE": "IG_Core", "IG_CORE": "IG_Core", "INVESTMENT GRADE CORE": "IG_Core",
+            "IG INTL HEDGED": "IG_Intl_Hedged", "IG_INTL_HEDGED": "IG_Intl_Hedged", "INTL IG HEDGED": "IG_Intl_Hedged",
+            "TREASURIES": "Treasuries", "UST": "Treasuries", "US TREASURIES": "Treasuries",
+            "CASH": "Cash", "TIPS": "TIPS", "ENERGY": "Energy",
+            "ILLIQUID AUTOMATTIC": "Illiquid_Automattic", "ILLIQUID_AUTOMATTIC": "Illiquid_Automattic",
+        }
+
+        def normalize_sleeve(x) -> str:
+            if x is None:
+                return ""
+            t = str(x).strip()
+            t = t.replace("—", "-").replace("–", "-")
+            upper = t.upper().replace("_", " ").replace("-", " ").strip()
+            return SLEEVE_ALIASES.get(upper, t.replace(" ", "_"))
+
+        # 1) exact symbol→sleeve map (extend as needed)
+        SYMBOL_TO_SLEEVE = {
+            # US core/value/growth/small/value
+            "VTI": "US_Core", "ITOT": "US_Core", "SPY": "US_Core",
+            "VTV": "US_Value", "IVE": "US_Value",
+            "IVW": "US_Growth", "QQQ": "US_Growth",
+            "VBR": "US_SmallValue", "IJS": "US_SmallValue",
+
+            # Intl developed / Emerging
+            "VEA": "Intl_DM", "IEFA": "Intl_DM",
+            "VWO": "EM", "IEMG": "EM",
+            "EMB": "EM_USD",
+
+            # Bonds
+            "AGG": "IG_Core", "BND": "IG_Core",
+            "BNDX": "IG_Intl_Hedged",
+            "IEF": "Treasuries", "TLT": "Treasuries", "SHY": "Treasuries",
+
+            # Cash & tips & sector
+            "BIL": "Cash", "SGOV": "Cash", "CASH": "Cash",
+            "TIP": "TIPS", "SCHP": "TIPS",
+            "XLE": "Energy",
+        }
+
+        # 2) fallback by Name keywords (broad, extend if needed)
+        NAME_KEYWORDS = [
+            ("US_SmallValue", ["SMALL", "SMALL-CAP", "SMALL CAP", "SMALLCAP", "SV", "SMALL VALUE"]),
+            ("US_Value", ["VALUE"]),
+            ("US_Growth", ["GROWTH"]),
+            ("US_Core", ["TOTAL US", "TOTAL STOCK", "S&P", "US EQUITY", "US CORE", "TOTAL MARKET", "CORE US"]),
+            ("Intl_DM", ["DEVELOPED", "EAFE", "INTL", "INTERNATIONAL", "EX-US"]),
+            ("EM_USD", ["EM USD", "EM (USD)", "EM USD BOND"]),
+            ("EM", ["EMERGING", "EM "]),
+            ("IG_Intl_Hedged", ["INTL HEDGED", "INTERNATIONAL HEDGED", "BNDX"]),
+            ("IG_Core", ["AGGREGATE", "CORE BOND", "INVESTMENT GRADE", "IG CORE", "BND", "AGG"]),
+            ("Treasuries", ["UST", "TREASUR", "T-NOTE", "T-BOND", "T-BILL", "GOVERNMENT"]),
+            ("TIPS", ["TIPS", "INFLATION"]),
+            ("Cash", ["CASH", "TREASURY BILL", "T-BILL", "ULTRA SHORT", "SGOV", "BIL"]),
+            ("Energy", ["ENERGY", "OIL", "XLE"]),
+            ("Illiquid_Automattic", ["AUTOMATTIC", "ILLIQUID"]),
+        ]
+
+        def infer_sleeve(symbol: str, name: str) -> str:
+            s = str(symbol or "").strip().upper()
+            n = str(name or "").strip().upper()
+            if s in SYMBOL_TO_SLEEVE:
+                return SYMBOL_TO_SLEEVE[s]
+            for sleeve, keys in NAME_KEYWORDS:
+                if any(k in n for k in keys):
+                    return sleeve
+            return "US_Core"  # safe default
+
+        # --- apply logic: keep existing sleeves, infer only where null/blank ---
+        if "Sleeve" not in df.columns:
+            df["Sleeve"] = ""
+
+        df["Sleeve"] = df["Sleeve"].fillna("").astype(str)
+
+        mask_blank = df["Sleeve"].str.strip().eq("")
+        if mask_blank.any():
+            df.loc[mask_blank, "Sleeve"] = [
+                infer_sleeve(sym, nm)
+                for sym, nm in zip(df.loc[mask_blank, "Symbol"], df.loc[mask_blank, "Name"])
+            ]
+
+        # normalize everything
+        df["Sleeve"] = df["Sleeve"].apply(normalize_sleeve)
+
     L = _norm_map(list(df.columns))
 
     # Sleeve-like column
