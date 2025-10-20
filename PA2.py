@@ -1,618 +1,216 @@
 #!/usr/bin/env python3
-# PA2.py — Efficient portfolio targets with robust schema + name normalization
-from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
-import math
-import re
+import json
 import numpy as np
 import pandas as pd
 
 try:
     import cvxpy as cp
-    _HAS_CVXPY = True
-except Exception:
-    _HAS_CVXPY = False
+except Exception as e:
+    print("cvxpy is required. Install with: pip install cvxpy", file=sys.stderr)
+    raise
 
+SLEEVE_MAP = {
+    "BIL": "Cash", "SHV": "Cash", "SGOV": "Cash", "CASH": "Cash",
+    "SPY": "US_Core", "IVV": "US_Core", "VTI": "US_Core", "ITOT": "US_Core",
+    "VOO": "US_Core", "SCHX": "US_Core",
+    "IWD": "US_Value", "VTV": "US_Value", "SPYV": "US_Value",
+    "IVW": "US_Growth", "VUG": "US_Growth", "SPYG": "US_Growth",
+    "IJS": "US_SmallValue", "VBR": "US_SmallValue", "SLYV": "US_SmallValue",
+    "EFA": "Intl_DM", "VEA": "Intl_DM", "IEFA": "Intl_DM",
+    "EEM": "EM", "VWO": "EM", "IEMG": "EM",
+    "EMB": "EM_USD",
+    "HYG": "IG_Core", "LQD": "IG_Core", "AGG": "IG_Core", "BND": "IG_Core",
+    "BNDX": "IG_Intl_Hedged", "IGIB": "IG_Core",
+    "IEF": "Treasuries", "IEI": "Treasuries", "TLT": "Treasuries", "SHY": "Treasuries",
+    "TIP": "TIPS", "SCHP": "TIPS",
+    "XLE": "Energy", "VDE": "Energy",
+}
 
-# -------------------------------
-# CLI
-# -------------------------------
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="EfficientPortfolioTargets (schema-flexible + name normalization)")
-    p.add_argument(
-        "--holdings",
-        default="portfolio_data/holdings.csv",
-        help="Path to holdings CSV (default: portfolio_data/holdings.csv)",
+DEFAULT_RETURNS_REL = "returns/sleeve_returns.csv"
+ILLQ = "Illiquid_Automattic"
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Efficient portfolio target generator."
     )
     p.add_argument(
-        "--returns",
-        default="sleeve_ERVol_Base_Nominal.csv",
-        help="Path to sleeve-level ER/Vol (narrow) or wide monthly returns (default shown).",
+        "--holdings", required=True,
+        help="Path to holdings.csv"
     )
     p.add_argument(
-        "--frontier-out",
-        default="allocations_frontier_Base_Nominal.csv",
-        help="CSV path for efficient frontier table.",
+        "--returns-file", default=DEFAULT_RETURNS_REL,
+        help="CSV of sleeve returns (Date as first col, then sleeve columns)."
     )
     p.add_argument(
-        "--allocation-out",
-        default="allocation_targetVol_8_Base_Nominal.csv",
-        help="CSV path for chosen target allocation (max Sharpe or constrained).",
-    )
-    p.add_argument(
-        "--target-vol",
-        type=float,
-        default=None,
-        help="If provided (e.g. 0.08 for 8%%), solve for maximum return at this volatility.",
-    )
-    p.add_argument(
-        "--exclude-sleeves",
-        default="Illiquid_Automattic",
-        help="Comma-separated sleeves to exclude from optimization/stats (default: Illiquid_Automattic).",
+        "--target-vol", type=float, default=None,
+        help="Target volatility as a decimal (e.g., 0.08 for 8%%)."
     )
     return p.parse_args()
 
+def read_holdings(path: str) -> pd.DataFrame:
+    f = Path(path)
+    if not f.exists():
+        raise SystemExit(f"[ERROR] Holdings file not found: {path}")
+    df = pd.read_csv(f)
+    needed_any = {"Symbol", "Name", "Quantity", "Price"}
+    if not needed_any.issubset(df.columns):
+        raise SystemExit(f"[ERROR] Holdings missing required columns: {sorted(needed_any - set(df.columns))}")
+    if "Sleeve" not in df.columns:
+        df["Sleeve"] = pd.NA
+    df["Sleeve"] = df["Sleeve"].astype("string")
+    q = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0.0)
+    px = pd.to_numeric(df["Price"], errors="coerce").fillna(0.0)
+    df["Value"] = q * px
+    return df
 
-def _must_exist(path: str | Path) -> Path:
-    p = Path(path).expanduser().resolve()
-    if not p.exists():
-        sys.exit(f"[ERROR] File not found: {p}")
-    return p
+def infer_sleeves(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["Sleeve"] = out["Sleeve"].astype("string").replace("", pd.NA)
 
+    syms = out["Symbol"].astype(str).str.upper().str.strip()
+    names = out["Name"].astype(str).str.upper().str.strip()
 
-# -------------------------------
-# Name normalization / aliases
-# -------------------------------
-_ALIAS = {
-    "CASH": "Cash",
-    "US CORE": "US_Core",
-    "US_CORE": "US_Core",
-    "US VALUE": "US_Value",
-    "US_VALUE": "US_Value",
-    "US GROWTH": "US_Growth",
-    "US_GROWTH": "US_Growth",
-    "US SMALLVALUE": "US_SmallValue",
-    "US SMALL VALUE": "US_SmallValue",
-    "US_SMALLVALUE": "US_SmallValue",
-    "US_SMALL_VALUE": "US_SmallValue",
-    "INTL DM": "Intl_DM",
-    "INTL_DM": "Intl_DM",
-    "IG CORE": "IG_Core",
-    "IG_CORE": "IG_Core",
-    "IG INTL HEDGED": "IG_Intl_Hedged",
-    "IG_INTL_HEDGED": "IG_Intl_Hedged",
-    "EM USD": "EM_USD",
-    "EM_USD": "EM_USD",
-    "TREASURIES": "Treasuries",
-    "TIPS": "TIPS",
-    "ENERGY": "Energy",
-    "EM": "EM",
-    "ILLQUID_AUTOMATTIC": "Illiquid_Automattic",
-    "ILLIQUID_AUTOMATTIC": "Illiquid_Automattic",
-    "AUTOMATTIC": "Illiquid_Automattic",
-}
+    inferred = []
+    for s, n in zip(syms, names):
+        if s in SLEEVE_MAP:
+            inferred.append(SLEEVE_MAP[s])
+        elif "TREAS" in n or "UST" in n or "STRIP" in n:
+            inferred.append("Treasuries")
+        elif "INFLATION" in n or "TIPS" in n:
+            inferred.append("TIPS")
+        elif "ENERGY" in n or "XLE" in n or "VDE" in n:
+            inferred.append("Energy")
+        else:
+            inferred.append("US_Core")
 
-def normalize_name(s: str) -> str:
-    if not isinstance(s, str):
-        s = "" if pd.isna(s) else str(s)
-    t = s.strip()
-    t = t.replace("-", " ").replace("/", " ")
-    t = re.sub(r"\s+", " ", t).strip()
-    key = t.upper()
-    if key in _ALIAS:
-        return _ALIAS[key]
-    # Generic fallback: convert spaces to underscores, Title-case words that match canonical style
-    if " " in t:
-        t2 = "_".join(w.capitalize() if w.isalpha() else w for w in t.split())
-    else:
-        t2 = t
-    return t2
+    inferred = pd.Series(inferred, index=out.index, dtype="string")
+    mask = out["Sleeve"].isna()
+    out.loc[mask, "Sleeve"] = inferred.loc[mask]
+    return out
 
+def load_returns(path: str) -> pd.DataFrame:
+    f = Path(path)
+    if not f.exists():
+        raise SystemExit(
+            "[ERROR] Could not find returns file. Place a CSV like:\n"
+            "  returns/sleeve_returns.csv\n"
+            "with columns: Date,<sleeve1>,<sleeve2>,...\n"
+            "Each column should be period returns (e.g., monthly decimal returns)."
+        )
+    r = pd.read_csv(f)
+    if "Date" not in r.columns:
+        raise SystemExit("[ERROR] returns file must have a 'Date' column")
+    r = r.set_index("Date")
+    r = r.apply(pd.to_numeric, errors="coerce")
+    r = r.dropna(how="all", axis=1).dropna(how="any", axis=0)
+    return r
 
-# -------------------------------
-# IO: robust holdings loader
-# -------------------------------
-def _norm_map(cols: list[str]) -> dict[str, str]:
-    return {c.lower().strip(): c for c in cols}
-
-def load_holdings(path: str | Path) -> pd.DataFrame:
-    """
-    Return DataFrame with columns: Sleeve, Value (floats).
-    Accepts many possible schemas; computes Value when absent.
-    """
-    p = _must_exist(path)
-    df = pd.read_csv(p)
-    if df.empty:
-        sys.exit("[ERROR] holdings CSV is empty.")
-
-        # --- Sleeve normalization & inference ---
-
-        SLEEVE_ALIASES = {
-            "US CORE": "US_Core", "US-CORE": "US_Core", "US_CORE": "US_Core", "CORE_US": "US_Core",
-            "CORE US": "US_Core",
-            "US VALUE": "US_Value", "US-VALUE": "US_Value", "US_VALUE": "US_Value",
-            "US GROWTH": "US_Growth", "US-GROWTH": "US_Growth", "US_GROWTH": "US_Growth",
-            "US SMALL VALUE": "US_SmallValue", "US SMALLVALUE": "US_SmallValue", "US_SMALL_VALUE": "US_SmallValue",
-            "US-SMALL-VALUE": "US_SmallValue",
-            "INTL DM": "Intl_DM", "INTL_DM": "Intl_DM", "INTERNATIONAL DM": "Intl_DM",
-            "INTL-DEVELOPED": "Intl_DM", "DEVELOPED EX-US": "Intl_DM",
-            "EM USD": "EM_USD", "EM_USD": "EM_USD", "EM (USD)": "EM_USD",
-            "EM": "EM", "EMERGING": "EM",
-            "IG CORE": "IG_Core", "IG_CORE": "IG_Core", "INVESTMENT GRADE CORE": "IG_Core",
-            "IG INTL HEDGED": "IG_Intl_Hedged", "IG_INTL_HEDGED": "IG_Intl_Hedged", "INTL IG HEDGED": "IG_Intl_Hedged",
-            "TREASURIES": "Treasuries", "UST": "Treasuries", "US TREASURIES": "Treasuries",
-            "CASH": "Cash", "TIPS": "TIPS", "ENERGY": "Energy",
-            "ILLIQUID AUTOMATTIC": "Illiquid_Automattic", "ILLIQUID_AUTOMATTIC": "Illiquid_Automattic",
-        }
-
-        def normalize_sleeve(x) -> str:
-            if x is None:
-                return ""
-            t = str(x).strip()
-            t = t.replace("—", "-").replace("–", "-")
-            upper = t.upper().replace("_", " ").replace("-", " ").strip()
-            return SLEEVE_ALIASES.get(upper, t.replace(" ", "_"))
-
-        # 1) exact symbol→sleeve map (extend as needed)
-        SYMBOL_TO_SLEEVE = {
-            # US core/value/growth/small/value
-            "VTI": "US_Core", "ITOT": "US_Core", "SPY": "US_Core",
-            "VTV": "US_Value", "IVE": "US_Value",
-            "IVW": "US_Growth", "QQQ": "US_Growth",
-            "VBR": "US_SmallValue", "IJS": "US_SmallValue",
-
-            # Intl developed / Emerging
-            "VEA": "Intl_DM", "IEFA": "Intl_DM",
-            "VWO": "EM", "IEMG": "EM",
-            "EMB": "EM_USD",
-
-            # Bonds
-            "AGG": "IG_Core", "BND": "IG_Core",
-            "BNDX": "IG_Intl_Hedged",
-            "IEF": "Treasuries", "TLT": "Treasuries", "SHY": "Treasuries",
-
-            # Cash & tips & sector
-            "BIL": "Cash", "SGOV": "Cash", "CASH": "Cash",
-            "TIP": "TIPS", "SCHP": "TIPS",
-            "XLE": "Energy",
-        }
-
-        # 2) fallback by Name keywords (broad, extend if needed)
-        NAME_KEYWORDS = [
-            ("US_SmallValue", ["SMALL", "SMALL-CAP", "SMALL CAP", "SMALLCAP", "SV", "SMALL VALUE"]),
-            ("US_Value", ["VALUE"]),
-            ("US_Growth", ["GROWTH"]),
-            ("US_Core", ["TOTAL US", "TOTAL STOCK", "S&P", "US EQUITY", "US CORE", "TOTAL MARKET", "CORE US"]),
-            ("Intl_DM", ["DEVELOPED", "EAFE", "INTL", "INTERNATIONAL", "EX-US"]),
-            ("EM_USD", ["EM USD", "EM (USD)", "EM USD BOND"]),
-            ("EM", ["EMERGING", "EM "]),
-            ("IG_Intl_Hedged", ["INTL HEDGED", "INTERNATIONAL HEDGED", "BNDX"]),
-            ("IG_Core", ["AGGREGATE", "CORE BOND", "INVESTMENT GRADE", "IG CORE", "BND", "AGG"]),
-            ("Treasuries", ["UST", "TREASUR", "T-NOTE", "T-BOND", "T-BILL", "GOVERNMENT"]),
-            ("TIPS", ["TIPS", "INFLATION"]),
-            ("Cash", ["CASH", "TREASURY BILL", "T-BILL", "ULTRA SHORT", "SGOV", "BIL"]),
-            ("Energy", ["ENERGY", "OIL", "XLE"]),
-            ("Illiquid_Automattic", ["AUTOMATTIC", "ILLIQUID"]),
-        ]
-
-        def infer_sleeve(symbol: str, name: str) -> str:
-            s = str(symbol or "").strip().upper()
-            n = str(name or "").strip().upper()
-            if s in SYMBOL_TO_SLEEVE:
-                return SYMBOL_TO_SLEEVE[s]
-            for sleeve, keys in NAME_KEYWORDS:
-                if any(k in n for k in keys):
-                    return sleeve
-            return "US_Core"  # safe default
-
-        # --- apply logic: keep existing sleeves, infer only where null/blank ---
-        if "Sleeve" not in df.columns:
-            df["Sleeve"] = ""
-
-        df["Sleeve"] = df["Sleeve"].fillna("").astype(str)
-
-        mask_blank = df["Sleeve"].str.strip().eq("")
-        if mask_blank.any():
-            df.loc[mask_blank, "Sleeve"] = [
-                infer_sleeve(sym, nm)
-                for sym, nm in zip(df.loc[mask_blank, "Symbol"], df.loc[mask_blank, "Name"])
-            ]
-
-        # normalize everything
-        df["Sleeve"] = df["Sleeve"].apply(normalize_sleeve)
-
-    L = _norm_map(list(df.columns))
-
-    # Sleeve-like column
-    sleeve_col = None
-    for key in ("sleeve", "class", "bucket", "assetclass", "sleeve_name"):
-        if key in L:
-            sleeve_col = L[key]
-            break
-    if sleeve_col is None:
-        for key in ("symbol", "ticker", "name"):
-            if key in L:
-                sleeve_col = L[key]
-                break
-    if sleeve_col is None:
-        sys.exit("[ERROR] could not find a Sleeve/Symbol/Name column to aggregate by.")
-
-    # Value or Quantity*Price
-    value_col = None
-    for key in ("value", "marketvalue", "currentvalue", "currvalue"):
-        if key in L:
-            value_col = L[key]
-            break
-    if value_col is None:
-        q_col = next((L[k] for k in ("quantity", "shares", "position") if k in L), None)
-        px_col = next((L[k] for k in ("price", "pricepershare", "currentprice", "lastprice") if k in L), None)
-        if q_col is None or px_col is None:
-            sys.exit("[ERROR] holdings must include Value or (Quantity and Price).")
-        df["__Value__"] = pd.to_numeric(df[q_col], errors="coerce").fillna(0.0) * pd.to_numeric(df[px_col], errors="coerce").fillna(0.0)
-        value_col = "__Value__"
-
-    tmp = (
-        df.groupby(sleeve_col, as_index=False)[value_col]
-        .sum()
-        .rename(columns={sleeve_col: "Sleeve", value_col: "Value"})
-    )
-    tmp["Sleeve"] = tmp["Sleeve"].apply(normalize_name)
-    tmp["Value"] = pd.to_numeric(tmp["Value"], errors="coerce").fillna(0.0)
-    tmp = tmp[tmp["Value"].abs() > 1e-12].copy()
-    return tmp[["Sleeve", "Value"]]
-
-
-# -------------------------------
-# IO: returns / ER / covariance
-# -------------------------------
-def load_returns_or_er_vol(path: str | Path) -> tuple[pd.Index, pd.Series, pd.DataFrame]:
-    """
-    Accept either:
-      1) Narrow: columns [Ticker|Sleeve], ER, Vol, optional correlation block
-      2) Wide: rows=dates, columns=tickers (periodic returns)
-    """
-    p = _must_exist(path)
-    raw = pd.read_csv(p)
-
-    id_col = None
-    for k in ("Ticker", "Sleeve", "Symbol", "Name"):
-        if k in raw.columns:
-            id_col = k
-            break
-
-    # Narrow ER/Vol
-    if id_col and {"ER", "Vol"}.issubset(raw.columns):
-        raw = raw.copy()
-        raw[id_col] = raw[id_col].astype(str).apply(normalize_name)
-        tickers = raw[id_col].astype(str)
-        mu = raw["ER"].astype(float)
-        vol = raw["Vol"].astype(float)
-
-        # Try correlation block
-        num_cols = [c for c in raw.columns if c not in {id_col, "ER", "Vol"} and pd.api.types.is_numeric_dtype(raw[c])]
-        Corr = None
-        if num_cols:
-            maybe = raw[num_cols].astype(float)
-            if maybe.shape[1] == len(tickers) and np.all((maybe.values >= -1) & (maybe.values <= 1)):
-                Corr = maybe.values
-        if Corr is None:
-            Corr = 0.20 * np.ones((len(tickers), len(tickers)))
-            np.fill_diagonal(Corr, 1.0)
-
-        D = np.diag(vol.values)
-        cov = D @ Corr @ D
-        mu.index = tickers
-        cov = pd.DataFrame(cov, index=tickers, columns=tickers)
-        return tickers, mu, cov
-
-    # Wide periodic returns
-    if id_col is None and any(pd.api.types.is_numeric_dtype(raw[c]) for c in raw.columns):
-        R = raw.select_dtypes(include=[np.number]).copy()
-        if R.shape[1] < 2:
-            sys.exit("[ERROR] returns file has <2 numeric columns; cannot build covariance.")
-        R.columns = [normalize_name(c) for c in R.columns]
-        mu = R.mean(axis=0) * 12.0
-        cov = R.cov() * 12.0
-        tickers = mu.index.astype(str)
-        cov.index = tickers
-        cov.columns = tickers
-        return tickers, mu, cov
-
-    sys.exit("[ERROR] returns file not recognized. Provide ER/Vol (narrow) or a wide returns table.")
-
-
-# -------------------------------
-# Optimizers
-# -------------------------------
-def max_sharpe(mu: pd.Series, cov: pd.DataFrame) -> pd.Series:
-    n = len(mu)
-    if _HAS_CVXPY:
-        w = cp.Variable(n)
-        ret = mu.values @ w
-        risk = cp.quad_form(w, cov.values)
-        lambdas = np.geomspace(1e-6, 10, 50)
-        best = None
-        best_s = -1e9
-        for lam in lambdas:
-            prob = cp.Problem(cp.Maximize(ret - lam * risk), [cp.sum(w) == 1, w >= 0])
-            try:
-                prob.solve(solver=cp.SCS, verbose=False, max_iters=8000)
-            except Exception:
-                try:
-                    prob.solve(solver=cp.ECOS, verbose=False, max_iters=20000)
-                except Exception:
-                    continue
-            if w.value is None:
-                continue
-            wv = np.clip(w.value, 0, None)
-            if wv.sum() <= 0:
-                continue
-            wv = wv / wv.sum()
-            r = float(mu.values @ wv)
-            v = float(math.sqrt(max(0.0, wv @ cov.values @ wv)))
-            s = r / (v + 1e-12)
-            if s > best_s:
-                best_s = s
-                best = wv.copy()
-        if best is None:
-            raise RuntimeError("No feasible solution for max Sharpe.")
-        return pd.Series(best, index=mu.index, name="Weight")
-
-    # Heuristic fallback
-    inv = np.linalg.pinv(cov.values)
-    raw = inv @ mu.values
-    raw = np.maximum(raw, 0)
-    w = raw / raw.sum()
-    return pd.Series(w, index=mu.index, name="Weight")
-
-# --- replace from here: normalize_inputs, max_return_at_vol, and the call site in main() ---
-
-def normalize_inputs(holdings_sleeve_weights: pd.Series,
-                     returns_by_sleeve: dict[str, pd.Series]) -> tuple[pd.Series, pd.DataFrame]:
-    """
-    Align holdings sleeves with available return series.
-    Returns (mu, cov) with matching index/columns (same sleeve order).
-    If no overlap, write debug file and return empty objects.
-    """
-    # holdings_sleeve_weights: index = sleeves, values = weights (sum to 1 ideally)
-    sleeves_h = pd.Index([str(s) for s in holdings_sleeve_weights.index if pd.notna(s)])
-
-    # stack returns into one DataFrame
-    rets = []
-    for sleeve, s in returns_by_sleeve.items():
-        if s is None:
-            continue
-        s = pd.Series(s).dropna()
-        if s.empty:
-            continue
-        rets.append(pd.DataFrame({"sleeve": str(sleeve), "ret": s}))
-    if not rets:
-        # nothing at all
-        Path("debug_no_overlap.json").write_text(json.dumps({
-            "reason": "no-return-series-available"
-        }, indent=2))
-        return pd.Series(dtype=float), pd.DataFrame()
-
-    R = pd.concat(rets, axis=0).pivot_table(index="ret".index if hasattr(rets[0], "index") else None,
-                                            columns="sleeve", values="ret")
-    # sleeves present in returns
-    sleeves_r = pd.Index([c for c in R.columns if pd.notna(c)])
-
-    # intersection (as strings)
-    sleeves_common = pd.Index(sorted(set(sleeves_h).intersection(set(sleeves_r))))
-    if len(sleeves_common) == 0:
-        dbg = {
-            "holdings_sleeves": list(map(str, sleeves_h)),
-            "returns_sleeves": list(map(str, sleeves_r)),
-            "note": "no-overlap"
-        }
-        Path("debug_no_overlap.json").write_text(json.dumps(dbg, indent=2))
-        return pd.Series(dtype=float), pd.DataFrame()
-
-    # restrict holdings weights and renormalize
-    w = holdings_sleeve_weights.reindex(sleeves_common).fillna(0.0)
-    total = float(w.sum())
+def weights_by_sleeve(df: pd.DataFrame) -> pd.Series:
+    by = df.groupby("Sleeve")["Value"].sum()
+    total = by.sum()
     if total <= 0:
-        # if user holdings all zero after restriction, default to equal weights
-        w = pd.Series(1.0, index=sleeves_common) / len(sleeves_common)
-    else:
-        w = w / total
+        raise SystemExit("[ERROR] Total holdings value is 0.")
+    w = by / total
+    return w
 
-    # compute mu and cov on overlapping sleeves (align columns)
-    R = R.reindex(columns=sleeves_common).dropna(how="any")
-    mu = R.mean().astype(float)
-    cov = R.cov().astype(float)
+def normalize_inputs(holdings_w: pd.Series, returns_df: pd.DataFrame):
+    sleeves_h = set(holdings_w.index)
+    sleeves_r = set(returns_df.columns)
+    common = sorted(sleeves_h & sleeves_r)
+    if ILLQ in common:
+        common.remove(ILLQ)
+    if len(common) == 0:
+        print("[WARN] After normalization, no sleeves overlap between holdings and returns.")
+        debug = {
+            "holdings_sleeves": sorted(list(sleeves_h)),
+            "returns_sleeves": sorted(list(sleeves_r)),
+        }
+        Path("debug_no_overlap.json").write_text(json.dumps(debug, indent=2))
+        return None, None, None
+    w = holdings_w.reindex(common).fillna(0.0)
+    r = returns_df[common].copy()
+    mu = r.mean().values
+    cov = r.cov().values
+    return w.index.tolist(), mu, cov
 
-    # sanity: index/cols must match
-    cov = cov.reindex(index=sleeves_common, columns=sleeves_common)
-    mu = mu.reindex(sleeves_common)
-
-    return mu, cov
-
-
-def max_return_at_vol(mu: pd.Series, cov: pd.DataFrame, target_vol: float) -> pd.Series:
-    """
-    Maximize mu^T w subject to w>=0, sum(w)=1, and w^T C w <= target_vol^2.
-    DCP-compliant: uses quad_form <= (target_vol**2)
-    Returns weights as a Series aligned to mu.index.
-    """
-    import cvxpy as cp
-    import numpy as np
-
-    if mu.empty or cov.empty or cov.shape[0] != len(mu):
-        raise ValueError("Inputs are empty or misaligned.")
-
-    sleeves = list(mu.index)
-    C = cov.values.astype(float)
-    n = len(sleeves)
-
-    # Variable
+def max_return_at_vol(mu: np.ndarray, cov: np.ndarray, target_vol: float) -> np.ndarray:
+    n = len(mu)
     w = cp.Variable(n)
-
-    # Objective
-    obj = cp.Maximize(mu.values @ w)
-
-    # Constraints (long-only, fully invested, volatility cap)
+    ret = mu @ w
+    risk = cp.quad_form(w, cov)
     cons = [
         cp.sum(w) == 1,
         w >= 0,
-        cp.quad_form(w, C) <= float(target_vol) ** 2
+        risk <= target_vol**2
     ]
-
-    prob = cp.Problem(obj, cons)
-
-    # Try a couple solvers; both satisfy DCP here.
-    solved = False
-    for solver in (cp.SCS, cp.ECOS):
-        try:
-            prob.solve(solver=solver, verbose=False, max_iters=20000)
-            if w.value is not None and prob.status in ("optimal", "optimal_inaccurate"):
-                solved = True
-                break
-        except Exception:
-            pass
-
-    if not solved:
-        # Final fallback: let CVXPY pick available solver
+    prob = cp.Problem(cp.Maximize(ret), cons)
+    prob.solve(solver=cp.SCS, verbose=False, max_iters=20000)
+    if w.value is None:
+        prob.solve(solver=cp.OSQP, verbose=False, max_iter=20000)
+    if w.value is None:
+        prob.solve(solver=cp.CVXOPT, verbose=False)
+    if w.value is None:
         prob.solve(verbose=False)
-        if w.value is None or prob.status not in ("optimal", "optimal_inaccurate"):
-            raise RuntimeError(f"Optimization failed: status={prob.status}")
+    if w.value is None:
+        raise SystemExit("[ERROR] Optimization failed to converge.")
+    sol = np.maximum(w.value, 0.0)
+    s = sol.sum()
+    return sol / s if s > 0 else sol
 
-    w_np = np.maximum(np.array(w.value, dtype=float), 0.0)
-    if w_np.sum() <= 0:
-        w_np = np.ones(n) / n
-    else:
-        w_np = w_np / w_np.sum()
+def max_sharpe(mu: np.ndarray, cov: np.ndarray) -> np.ndarray:
+    n = len(mu)
+    w = cp.Variable(n)
+    risk = cp.quad_form(w, cov)
+    eps = 1e-8
+    obj = (mu @ w) - eps * cp.sum_squares(w)
+    cons = [cp.sum(w) == 1, w >= 0]
+    prob = cp.Problem(cp.Maximize(obj), cons)
+    prob.solve(solver=cp.SCS, verbose=False, max_iters=20000)
+    if w.value is None:
+        prob.solve(solver=cp.OSQP, verbose=False, max_iter=20000)
+    if w.value is None:
+        prob.solve(verbose=False)
+    if w.value is None:
+        raise SystemExit("[ERROR] Sharpe optimization failed.")
+    sol = np.maximum(w.value, 0.0)
+    s = sol.sum()
+    return sol / s if s > 0 else sol
 
-    return pd.Series(w_np, index=sleeves, name="Weight")
-
-
-# --- In main(), replace just the optimization call block with this safer version ---
-
-# build mu, cov from current holdings + returns
-mu, cov = normalize_inputs(holdings_sleeve_weights, returns_by_sleeve)
-
-if mu.empty or cov.empty:
-    print("[WARN] After normalization, no sleeves overlap between holdings and returns.")
-    print("       Wrote debugging info to debug_no_overlap.json")
-    sys.exit(1)
-
-if args.target_vol is not None:
-    w = max_return_at_vol(mu, cov, float(args.target_vol))
-else:
-    # example: maximum Sharpe or min-var fallback when no target provided
-    w = max_return_at_vol(mu, cov, 0.10)  # pick a default cap if you like
-
-# report using aligned vectors
-expected_ret = float(np.dot(mu.values, w.values))
-risk = float(np.sqrt(np.dot(w.values, np.dot(cov.values, w.values))))
-print(f"Expected Return %: {expected_ret*100:.2f}")
-print(f"Volatility %: {risk*100:.2f}")
-print(f"Sharpe: {expected_ret / max(risk, 1e-12):.2f}")
-print("\nWeights (%):")
-print((w * 100).round(2))
-# --- replace end ---
-
-
-# -------------------------------
-# Stats & frontier
-# -------------------------------
-def portfolio_stats(w: pd.Series, mu: pd.Series, cov: pd.DataFrame) -> tuple[float, float, float]:
-    r = float((mu * w).sum())
-    v = float(math.sqrt(max(0.0, w.values @ cov.values @ w.values)))
-    s = r / (v + 1e-12)
-    return r, v, s
-
-
-def save_frontier(mu: pd.Series, cov: pd.DataFrame, out_csv: str | Path):
-    vols = np.linspace(0.02, max(0.30, float(np.sqrt(np.diag(cov.values)).max()) * 1.2), 21)
-    rows = []
-    for tv in vols:
-        try:
-            w = max_return_at_vol(mu, cov, tv)
-            r, v, s = portfolio_stats(w, mu, cov)
-            rows.append({"TargetVol": tv, "ER": r, "Vol": v, "Sharpe": s, **w.to_dict()})
-        except Exception:
-            continue
-    if rows:
-        pd.DataFrame(rows).to_csv(out_csv, index=False)
-
-
-# -------------------------------
-# Main
-# -------------------------------
 def main():
     args = parse_args()
 
-    # Load inputs
-    holdings = load_holdings(args.holdings)
-    tickers, mu, cov = load_returns_or_er_vol(args.returns)
+    df = read_holdings(args.holdings)
+    df = infer_sleeves(df)
 
-    # Exclusions
-    excl = [normalize_name(s) for s in str(args.exclude_sleeves).split(",") if s.strip()]
-    if excl:
-        holdings = holdings[~holdings["Sleeve"].isin(excl)].copy()
+    r = load_returns(args.returns_file)
 
-    # Align names
-    tickers_set = set([normalize_name(x) for x in tickers])
-    holdings["Sleeve"] = holdings["Sleeve"].apply(normalize_name)
+    w_sleeve = weights_by_sleeve(df)
 
-    overlap = sorted(set(holdings["Sleeve"]).intersection(tickers_set))
-    if not overlap:
-        # Diagnostic + graceful continue
-        dbg = {
-            "holdings_unique": sorted(set(holdings["Sleeve"])),
-            "returns_unique": sorted(tickers_set),
-        }
-        Path("debug_no_overlap.json").write_text(pd.Series(dbg).to_json(indent=2))
-        print("[WARN] After normalization, no sleeves overlap between holdings and returns.")
-        print("       Wrote debugging info to debug_no_overlap.json")
-        # Proceed with full returns universe to keep you unblocked
-        pass
-    else:
-        # Restrict mu/cov to the overlap (recommended)
-        mu = mu.loc[overlap]
-        cov = cov.loc[overlap, overlap]
+    common, mu, cov = normalize_inputs(w_sleeve, r)
+    if common is None:
+        raise SystemExit(1)
 
-    # Solve
     if args.target_vol is not None:
         w = max_return_at_vol(mu, cov, float(args.target_vol))
     else:
         w = max_sharpe(mu, cov)
 
-    er, vol, sharpe = portfolio_stats(w, mu, cov)
+    out = pd.Series(w, index=common, name="Weight")
+    out = (out / out.sum()).sort_values(ascending=False)
 
-    # Report
-    weights_pct = (w * 100).round(2).sort_values(ascending=False)
+    port_mu = float(np.dot(mu, w))
+    port_vol = float(np.sqrt(w @ cov @ w))
+    sharpe = port_mu / port_vol if port_vol > 0 else np.nan
+
     print("Weights (%):")
-    print(weights_pct)
-
-    print(f"\nExpected Return %: {er*100:.2f}")
-    print(f"Volatility %: {vol*100:.2f}")
+    print((out * 100).round(2).to_frame().T if len(out) < 20 else (out * 100).round(2))
+    print("")
+    print(f"Expected Return %: {(port_mu*100):.2f}")
+    print(f"Volatility %: {(port_vol*100):.2f}")
     print(f"Sharpe: {sharpe:.2f}")
-
-    # Correlation preview
-    try:
-        sd = np.sqrt(np.diag(cov.values))
-        with np.errstate(divide="ignore", invalid="ignore"):
-            Corr = cov.values / np.outer(sd, sd)
-        Corr = np.clip(Corr, -1, 1)
-        corr_df = pd.DataFrame(Corr, index=mu.index, columns=mu.index)
-        print("\nCorrelation matrix:")
-        print(corr_df.round(2))
-    except Exception:
-        pass
-
-    # Outputs
-    Path(args.frontier_out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.allocation_out).parent.mkdir(parents=True, exist_ok=True)
-    w.to_frame("Weight").to_csv(args.allocation_out)
-    save_frontier(mu, cov, args.frontier_out)
-    print(f"\nSaved: {args.allocation_out}")
-    print(f"Saved: {args.frontier_out}")
-
 
 if __name__ == "__main__":
     main()
