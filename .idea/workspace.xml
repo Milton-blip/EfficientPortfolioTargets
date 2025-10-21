@@ -5,17 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="e28a8447-691c-4b2a-9a63-587b57b0857b" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/csv-editor.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/csv-editor.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/tools/validate_pa2_run.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/PA2_Command_Guide.pdf" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/allocation_targetVol_8_Base_Nominal.csv" beforeDir="false" afterPath="$PROJECT_DIR$/allocation_targetVol_8_Base_Nominal.csv" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/allocations_frontier_Base_Nominal.csv" beforeDir="false" afterPath="$PROJECT_DIR$/allocations_frontier_Base_Nominal.csv" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/portfolio_data/holdings.csv" beforeDir="false" afterPath="$PROJECT_DIR$/portfolio_data/holdings.csv" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/sleeve_ERVol_Base_Nominal.csv" beforeDir="false" afterPath="$PROJECT_DIR$/sleeve_ERVol_Base_Nominal.csv" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tools/list_raw_files.py" beforeDir="false" afterPath="$PROJECT_DIR$/tools/list_raw_files.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tools/run_all_scenarios.sh" beforeDir="false" afterPath="$PROJECT_DIR$/tools/run_all_scenarios.sh" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tools/write_sample_returns.py" beforeDir="false" afterPath="$PROJECT_DIR$/tools/write_sample_returns.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/PA2.py" beforeDir="false" afterPath="$PROJECT_DIR$/PA2.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/TradeList" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -66,7 +60,7 @@
     "Shell Script.list_raw_files.sh.executor": "Run",
     "Shell Script.run_all_scenarios.sh.executor": "Run",
     "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
-    "git-widget-placeholder": "feature/holdings-arg",
+    "git-widget-placeholder": "main",
     "junie.onboarding.icon.badge.shown": "true",
     "last_opened_file_path": "/Users/tkeller/PycharmProjects/EfficientPortfolioTargets",
     "node.js.detected.package.eslint": "true",
@@ -81,6 +75,7 @@
 }]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$" />
       <recent name="$USER_HOME$/Desktop/Portfolio Data 20225-10-05" />
     </key>
     <key name="MoveFile.RECENT_KEYS">
@@ -198,7 +193,7 @@
       <workItem from="1760746867722" duration="29000" />
       <workItem from="1760746909157" duration="357000" />
       <workItem from="1760747272821" duration="347000" />
-      <workItem from="1760747621534" duration="14208000" />
+      <workItem from="1760747621534" duration="19296000" />
     </task>
     <servers />
   </component>

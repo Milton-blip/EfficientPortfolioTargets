@@ -13,6 +13,7 @@ portfolio_data/
 # Outputs
 outputs/
 portfolio_targets/
+old_output/
 
 # Miscellaneous
 *.pdf
