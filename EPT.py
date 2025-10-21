@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional, List  # ← compat typing
 
 import numpy as np
 import pandas as pd
@@ -17,7 +18,6 @@ SLEEVE_MAP_CSV = PROJECT_ROOT / "portfolio_data" / "sleeve_map.csv"
 
 
 def _infer_returns_label(returns_path: str) -> str:
-    """Return 'Nominal' or 'Real' based on filename."""
     rp = str(returns_path).lower()
     if "real" in rp:
         return "Real"
@@ -42,8 +42,7 @@ def plot_frontier_pretty(
     outputs_dir="outputs",
 ):
     """
-    Produce a frontier chart with style and labeling consistent with the
-    reference design. All returns/vols are decimal (e.g. 0.08 = 8%).
+    Produce a frontier chart. All inputs here are in DECIMALS (0.08 = 8%).
     """
     import matplotlib.pyplot as plt
     from pathlib import Path
@@ -59,7 +58,7 @@ def plot_frontier_pretty(
         [r * 100 for r in frontier_rets],
         color="#0b245b",
         linewidth=3.0,
-        label="Frontier (Automattic fixed)",
+        label="Frontier",
     )
 
     # Target vol point
@@ -129,9 +128,7 @@ def plot_frontier_pretty(
     title = f"Efficient Frontier + 8% Target ({scenario_name}, {label_nv})"
     plt.title(title, fontsize=18, pad=12)
 
-    lg = plt.legend(
-        framealpha=0.9, facecolor="white", edgecolor="#cccccc", fontsize=12
-    )
+    lg = plt.legend(framealpha=0.9, facecolor="white", edgecolor="#cccccc", fontsize=12)
     for lh in lg.legendHandles:
         if hasattr(lh, "set_linewidth"):
             lh.set_linewidth(2.0)
@@ -146,17 +143,19 @@ def plot_frontier_pretty(
 
     return str(out_png)
 
+
 def ensure_outputs_dir():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def canon(x) -> str:
     return str(x).strip()
 
+
 def load_sleeve_map(csv_path: Path) -> pd.DataFrame:
     if not csv_path.exists():
         raise SystemExit(
-            f"[ERROR] Could not find sleeve map: {csv_path}\n"
-            f"Create it with headers: Symbol,Sleeve"
+            f"[ERROR] Could not find sleeve map: {csv_path}\nCreate it with headers: Symbol,Sleeve"
         )
     df = pd.read_csv(csv_path)
     need = {"Symbol", "Sleeve"}
@@ -170,6 +169,7 @@ def load_sleeve_map(csv_path: Path) -> pd.DataFrame:
     df["Sleeve"] = df["Sleeve"].map(canon)
     return df
 
+
 def assign_sleeves(holdings: pd.DataFrame, sleeve_map: pd.DataFrame) -> pd.DataFrame:
     out = holdings.copy()
     for col in ["Symbol", "Sleeve"]:
@@ -182,6 +182,7 @@ def assign_sleeves(holdings: pd.DataFrame, sleeve_map: pd.DataFrame) -> pd.DataF
     out.loc[mask, "Sleeve"] = out.loc[mask, "Symbol"].map(sym2sleeve).fillna("")
     return out
 
+
 def load_returns(returns_csv: Path) -> pd.DataFrame:
     if not returns_csv.exists():
         raise FileNotFoundError(str(returns_csv))
@@ -189,6 +190,7 @@ def load_returns(returns_csv: Path) -> pd.DataFrame:
     if "Date" not in rf.columns:
         raise SystemExit("[ERROR] returns file must have a 'Date' column")
     return rf
+
 
 def compute_current_sleeve_weights(holdings: pd.DataFrame) -> pd.Series:
     if "MarketValue" in holdings.columns:
@@ -206,6 +208,7 @@ def compute_current_sleeve_weights(holdings: pd.DataFrame) -> pd.Series:
     w = by_sleeve / total
     return w.sort_index()
 
+
 def align_and_build_stats(holdings_w: pd.Series, returns_df: pd.DataFrame):
     sleeves_hold = set(holdings_w.index)
     ret_cols = [c for c in returns_df.columns if c != "Date"]
@@ -213,29 +216,37 @@ def align_and_build_stats(holdings_w: pd.Series, returns_df: pd.DataFrame):
     common = sorted(sleeves_hold & sleeves_ret)
     if not common:
         ensure_outputs_dir()
-        dbg = {"holdings_sleeves": sorted(sleeves_hold), "returns_sleeves": sorted(sleeves_ret)}
+        dbg = {
+            "holdings_sleeves": sorted(sleeves_hold),
+            "returns_sleeves": sorted(sleeves_ret),
+        }
         (OUTPUT_DIR / "debug_no_overlap.json").write_text(json.dumps(dbg, indent=2))
         raise SystemExit(
             "[ERROR] After normalization, no sleeves overlap between holdings and returns.\n"
             "       Wrote debugging info to outputs/debug_no_overlap.json"
         )
-    R = returns_df[common].dropna().astype(float)
-    mu = R.mean() * 100.0
-    cov = np.cov(R.values, rowvar=False)
+    R = returns_df[common].dropna().astype(float)  # decimals
+    mu = R.mean() * 100.0                           # percent
+    cov = np.cov(R.values, rowvar=False)            # decimals^2
     cov = pd.DataFrame(cov, index=common, columns=common)
     return mu, cov, pd.Index(common)
 
-def solve_max_return_at_vol(mu: pd.Series, cov: pd.DataFrame, target_vol: float,
-                            max_weight: float | None = None,
-                            min_weight: float | None = None,
-                            l2_to_current: float | None = None,
-                            current_w: pd.Series | None = None) -> pd.Series:
+
+def solve_max_return_at_vol(
+    mu: pd.Series,
+    cov: pd.DataFrame,
+    target_vol: float,
+    max_weight: Optional[float] = None,
+    min_weight: Optional[float] = None,
+    l2_to_current: Optional[float] = None,
+    current_w: Optional[pd.Series] = None,
+) -> pd.Series:
     sleeves = mu.index.tolist()
     n = len(sleeves)
     if n == 0:
         raise SystemExit("[ERROR] No sleeves to optimize after alignment.")
     w = cp.Variable(n)
-    mu_vec = mu.values / 100.0
+    mu_vec = mu.values / 100.0  # decimals
     cov_mat = cov.values
     expected_ret = mu_vec @ w
     variance = cp.quad_form(w, cov_mat)
@@ -256,12 +267,14 @@ def solve_max_return_at_vol(mu: pd.Series, cov: pd.DataFrame, target_vol: float,
     if w.value is None:
         raise SystemExit("[ERROR] Optimization failed to converge with available solvers.")
     sol = pd.Series(np.clip(w.value, 0, None), index=sleeves)
-    sol = sol / sol.sum()
-    return sol
+    return sol / sol.sum()
 
-def solve_min_variance(cov: pd.DataFrame,
-                       max_weight: float | None = None,
-                       min_weight: float | None = None) -> pd.Series:
+
+def solve_min_variance(
+    cov: pd.DataFrame,
+    max_weight: Optional[float] = None,
+    min_weight: Optional[float] = None,
+) -> pd.Series:
     n = cov.shape[0]
     w = cp.Variable(n)
     cov_mat = cov.values
@@ -277,12 +290,17 @@ def solve_min_variance(cov: pd.DataFrame,
         prob.solve(solver=cp.ECOS, verbose=False, max_iters=20000)
     if w.value is None:
         raise SystemExit("[ERROR] Min-variance solve failed.")
-    return pd.Series(np.clip(w.value, 0, None), index=cov.index).pipe(lambda s: s / s.sum())
+    s = pd.Series(np.clip(w.value, 0, None), index=cov.index)
+    return s / s.sum()
 
-def solve_max_sharpe(mu: pd.Series, cov: pd.DataFrame,
-                     max_weight: float | None = None,
-                     min_weight: float | None = None) -> pd.Series:
-    # maximize (mu @ w) / sqrt(w' Σ w)  -> maximize mu@w  s.t. w'Σw <= 1 and sum w = 1, w>=0
+
+def solve_max_sharpe(
+    mu: pd.Series,
+    cov: pd.DataFrame,
+    max_weight: Optional[float] = None,
+    min_weight: Optional[float] = None,
+) -> pd.Series:
+    # maximize mu@w  s.t. w'Σw <= 1, sum w = 1, w>=0
     n = len(mu)
     w = cp.Variable(n)
     mu_vec = mu.values / 100.0
@@ -302,25 +320,28 @@ def solve_max_sharpe(mu: pd.Series, cov: pd.DataFrame,
     s = pd.Series(np.clip(w.value, 0, None), index=mu.index)
     return s / s.sum()
 
+
 def realized_stats(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame):
     w = weights.reindex(mu.index).values
     mu_vec = mu.values / 100.0
     cov_mat = cov.reindex(index=mu.index, columns=mu.index).values
-    exp_ret = float(mu_vec @ w) * 100.0
-    vol = float(np.sqrt(w @ cov_mat @ w)) * 100.0
+    exp_ret = float(mu_vec @ w) * 100.0  # percent
+    vol = float(np.sqrt(w @ cov_mat @ w)) * 100.0  # percent
     sharpe = exp_ret / vol if vol > 0 else np.nan
     return exp_ret, vol, sharpe
 
-def plot_frontier(mu: pd.Series,
-                  cov: pd.DataFrame,
-                  target_w: pd.Series,
-                  current_w: pd.Series | None,
-                  ret_type_label: str,
-                  target_vol: float):
+
+def plot_frontier(
+    mu: pd.Series,
+    cov: pd.DataFrame,
+    target_w: pd.Series,
+    current_w: Optional[pd.Series],
+    ret_type_label: str,
+    target_vol: float,
+):
     ensure_outputs_dir()
 
-    vols = []
-    rets = []
+    vols, rets = [], []
     grid = np.linspace(max(0.0025, 0.5 * target_vol), max(target_vol * 1.8, target_vol + 0.03), 40)
     for tv in grid:
         try:
@@ -346,7 +367,7 @@ def plot_frontier(mu: pd.Series,
 
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     if vols and rets:
-        ax.plot(vols, rets, color="navy", lw=2.0, label="Frontier (Automattic fixed)")
+        ax.plot(vols, rets, color="navy", lw=2.0, label="Frontier")
 
     ax.scatter([t_v], [t_r], s=80, edgecolors="black", facecolors="gold", label="Target 8 percent Vol")
     ax.scatter([ms_v], [ms_r], s=40, color="green", label="MaxSharpe")
@@ -365,6 +386,7 @@ def plot_frontier(mu: pd.Series,
     plt.close(fig)
     print(f"Saved frontier figure: {out_png}")
 
+
 def print_results(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame, target_vol: float):
     df = pd.DataFrame({"Weight%": (weights * 100.0).round(2)}).sort_values("Weight%", ascending=False)
     print("\nWeights (%):")
@@ -376,7 +398,8 @@ def print_results(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame, target_v
     print("\nMean period returns by sleeve (%), descending:")
     print(mu.sort_values(ascending=False).round(3))
 
-def auto_generate_returns_if_needed(args, sleeves_in_holdings: list[str]) -> None:
+
+def auto_generate_returns_if_needed(args, sleeves_in_holdings: List[str]) -> None:
     ret_csv = Path(args.returns_file) if args.returns_file else DEFAULT_RETURNS
     need_gen = False
     if not ret_csv.exists():
@@ -385,9 +408,12 @@ def auto_generate_returns_if_needed(args, sleeves_in_holdings: list[str]) -> Non
         cmd = [
             sys.executable,
             str(PROJECT_ROOT / "tools" / "write_sample_returns.py"),
-            "--sleeve-map", str(SLEEVE_MAP_CSV),
-            "--months", "180",
-            "--out", str(ret_csv),
+            "--sleeve-map",
+            str(SLEEVE_MAP_CSV),
+            "--months",
+            "180",
+            "--out",
+            str(ret_csv),
         ]
         try:
             subprocess.run(cmd, check=True, capture_output=True)
@@ -400,20 +426,34 @@ def auto_generate_returns_if_needed(args, sleeves_in_holdings: list[str]) -> Non
                 pass
             raise SystemExit("[ERROR] Failed to auto-generate returns.")
 
+
 def parse_args():
     p = argparse.ArgumentParser(description="EfficientPortfolioTargets optimizer")
     p.add_argument("--holdings", required=True, help="Path to holdings CSV.")
-    p.add_argument("--target-vol", type=float, required=True,
-                   help="Target volatility (example: 0.08 for 8 percent).")
+    p.add_argument(
+        "--target-vol",
+        type=float,
+        required=True,
+        help="Target volatility (example: 0.08 for 8 percent).",
+    )
     p.add_argument("--returns-file", default=str(DEFAULT_RETURNS), help="Path to returns CSV.")
     p.add_argument("--max-weight", type=float, default=None, help="Optional per-sleeve max weight (0–1).")
     p.add_argument("--min-weight", type=float, default=None, help="Optional per-sleeve min weight (0–1).")
     p.add_argument("--l2-to-current", type=float, default=None, help="Optional L2 penalty to current weights.")
-    p.add_argument("--auto-regen", dest="auto_regen", action="store_true",
-                   help="Auto-generate returns if missing and retry if solution is overly concentrated.")
-    p.add_argument("--return-type", choices=["nominal", "real"], default="nominal",
-                   help="Used only for labeling charts: nominal or real.")
+    p.add_argument(
+        "--auto-regen",
+        dest="auto_regen",
+        action="store_true",
+        help="Auto-generate returns if missing and retry if solution is overly concentrated.",
+    )
+    p.add_argument(
+        "--return-type",
+        choices=["nominal", "real"],
+        default="nominal",
+        help="Used only for labeling charts: nominal or real.",
+    )
     return p.parse_args()
+
 
 def main():
     ensure_outputs_dir()
@@ -470,20 +510,23 @@ def main():
 
     print_results(w, mu.reindex(w.index), cov.reindex(index=w.index, columns=w.index), args.target_vol)
 
-    # --- build frontier grid and key points for pretty plot ---
+    # --- build frontier grid and key points for pretty plot (DECIMAL inputs for pretty plot) ---
     vols_on_grid, rets_on_grid = [], []
-    grid = np.linspace(max(0.0025, 0.5 * float(args.target_vol)),
-                       max(float(args.target_vol) * 1.8, float(args.target_vol) + 0.03), 40)
+    grid = np.linspace(
+        max(0.0025, 0.5 * float(args.target_vol)),
+        max(float(args.target_vol) * 1.8, float(args.target_vol) + 0.03),
+        40,
+    )
     for tv in grid:
         try:
             w_tv = solve_max_return_at_vol(mu, cov, tv)
-            r_tv, v_tv, _ = realized_stats(w_tv, mu, cov)  # returns in %
-            rets_on_grid.append(r_tv / 100.0)  # convert to decimals for pretty plot
-            vols_on_grid.append(v_tv / 100.0)
+            r_tv, v_tv, _ = realized_stats(w_tv, mu, cov)  # percent
+            rets_on_grid.append(r_tv / 100.0)             # decimal for pretty
+            vols_on_grid.append(v_tv / 100.0)             # decimal for pretty
         except Exception:
             pass
 
-    # Key points
+    # Key points (percent from realized_stats → convert to decimals for pretty plot)
     w_min = solve_min_variance(cov)
     mu_minvol, vol_minvol, _ = realized_stats(w_min, mu, cov)
 
@@ -498,10 +541,10 @@ def main():
 
     png_path = plot_frontier_pretty(
         returns_path=args.returns_file or "returns/sleeve_returns.csv",
-        frontier_vols=vols_on_grid,  # decimals
-        frontier_rets=rets_on_grid,  # decimals
-        mu_target=mu_at_target / 100.0,  # decimals
-        vol_target=vol_at_target / 100.0,
+        frontier_vols=vols_on_grid,                 # decimals
+        frontier_rets=rets_on_grid,                 # decimals
+        mu_target=mu_at_target / 100.0,             # decimals
+        vol_target=vol_at_target / 100.0,           # decimals
         mu_current=(mu_current / 100.0) if mu_current is not None else None,
         vol_current=(vol_current / 100.0) if vol_current is not None else None,
         mu_minvol=mu_minvol / 100.0,
@@ -520,6 +563,7 @@ def main():
     }
     (OUTPUT_DIR / "ept_last_run.json").write_text(json.dumps(snapshot, indent=2))
     print(f"Saved run snapshot: {OUTPUT_DIR / 'ept_last_run.json'}")
+
 
 if __name__ == "__main__":
     main()
