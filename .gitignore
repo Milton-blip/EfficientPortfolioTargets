@@ -9,6 +9,7 @@ old_output/
 # Portfolio Data
 holdings.csv
 portfolio_data/
+returns/
 
 # Outputs
 outputs/

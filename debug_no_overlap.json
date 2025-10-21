@@ -1,0 +1,16 @@
+{
+  "holdings_sleeves": [
+    "nan"
+  ],
+  "returns_sleeves": [
+    "Cash",
+    "EM",
+    "Energy",
+    "IG_Intl_Hedged",
+    "Intl_DM",
+    "US_Core",
+    "US_Growth",
+    "US_SmallValue",
+    "US_Value"
+  ]
+}
