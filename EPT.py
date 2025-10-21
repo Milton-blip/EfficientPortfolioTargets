@@ -607,9 +607,28 @@ def main():
 
     print_results(w, mu.reindex(w.index), cov.reindex(index=w.index, columns=w.index), args.target_vol, ret_label)
 
+    # --- build MinVol / MaxSharpe under the SAME bounds used for the frontier ---
+    w_min = solve_min_variance(
+        cov.reindex(index=common, columns=common),
+        max_weight=args.max_weight,
+        min_weight=args.min_weight,
+    )
+    mu_minvol, vol_minvol, _ = realized_stats(
+        w_min, mu.reindex(common), cov.reindex(index=common, columns=common)
+    )
+
+    w_ms = solve_max_sharpe(
+        mu.reindex(common),
+        cov.reindex(index=common, columns=common),
+        max_weight=args.max_weight,
+        min_weight=args.min_weight,
+    )
+    mu_maxsharpe, vol_maxsharpe, _ = realized_stats(
+        w_ms, mu.reindex(common), cov.reindex(index=common, columns=common)
+    )
+
     # --- build frontier via gamma-sweep for a smooth/convex curve (inputs to pretty plot are DECIMALS) ---
-    # Wider gamma sweep to reach both extremes
-    gamma_grid = np.logspace(-3, 6, 240)
+    gamma_grid = np.logspace(-3, 6, 240)  # wide sweep to hit both extremes
     vols_on_grid, rets_on_grid = frontier_by_gamma(
         mu.reindex(common),
         cov.reindex(index=common, columns=common),
@@ -618,45 +637,29 @@ def main():
         min_weight=args.min_weight,
     )
 
-    # Ensure the curve includes exact MinVol and MaxSharpe points
-    extra_pts = []
-    # Add MinVol and MaxSharpe computed under the same bounds
-    extra_pts.append((vol_minvol / 100.0, mu_minvol / 100.0))
-    extra_pts.append((vol_maxsharpe / 100.0, mu_maxsharpe / 100.0))
-
+    # Ensure the curve includes the exact MinVol and MaxSharpe endpoints
     if vols_on_grid and rets_on_grid:
-        import pandas as pd
         df_front = pd.DataFrame({"vol": vols_on_grid, "ret": rets_on_grid})
-        df_extra = pd.DataFrame(extra_pts, columns=["vol", "ret"])
+        df_extra = pd.DataFrame(
+            {
+                "vol": [vol_minvol / 100.0, vol_maxsharpe / 100.0],
+                "ret": [mu_minvol / 100.0, mu_maxsharpe / 100.0],
+            }
+        )
         df_all = (
             pd.concat([df_front, df_extra], ignore_index=True)
             .sort_values("vol")
             .drop_duplicates(subset=["vol"], keep="last")
         )
-        # Upper envelope to remove any tiny numerical dips
+        # Upper envelope to eliminate tiny numerical dips—ensures convex-looking frontier
         df_all["ret"] = df_all["ret"].cummax()
         vols_on_grid = df_all["vol"].tolist()
         rets_on_grid = df_all["ret"].tolist()
     else:
-        vols_on_grid = [v for v, _ in extra_pts]
-        rets_on_grid = [r for _, r in extra_pts]
+        vols_on_grid = [vol_minvol / 100.0, vol_maxsharpe / 100.0]
+        rets_on_grid = [mu_minvol / 100.0, mu_maxsharpe / 100.0]
 
-    # Key points (percent from realized_stats → convert to decimals for pretty plot)
-    w_min = solve_min_variance(
-        cov.reindex(index=common, columns=common),
-        max_weight=args.max_weight,
-        min_weight=args.min_weight,
-    )
-    mu_minvol, vol_minvol, _ = realized_stats(w_min, mu.reindex(common), cov.reindex(index=common, columns=common))
-
-    w_ms = solve_max_sharpe(
-        mu.reindex(common),
-        cov.reindex(index=common, columns=common),
-        max_weight=args.max_weight,
-        min_weight=args.min_weight,
-    )
-    mu_maxsharpe, vol_maxsharpe, _ = realized_stats(w_ms, mu.reindex(common), cov.reindex(index=common, columns=common))
-
+    # --- key points for pretty plot (convert % -> decimals) ---
     mu_at_target, vol_at_target, _ = realized_stats(w, mu, cov)
 
     mu_current = vol_current = None
