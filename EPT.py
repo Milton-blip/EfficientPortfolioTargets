@@ -470,21 +470,46 @@ def main():
 
     print_results(w, mu.reindex(w.index), cov.reindex(index=w.index, columns=w.index), args.target_vol)
 
+    # --- build frontier grid and key points for pretty plot ---
+    vols_on_grid, rets_on_grid = [], []
+    grid = np.linspace(max(0.0025, 0.5 * float(args.target_vol)),
+                       max(float(args.target_vol) * 1.8, float(args.target_vol) + 0.03), 40)
+    for tv in grid:
+        try:
+            w_tv = solve_max_return_at_vol(mu, cov, tv)
+            r_tv, v_tv, _ = realized_stats(w_tv, mu, cov)  # returns in %
+            rets_on_grid.append(r_tv / 100.0)  # convert to decimals for pretty plot
+            vols_on_grid.append(v_tv / 100.0)
+        except Exception:
+            pass
+
+    # Key points
+    w_min = solve_min_variance(cov)
+    mu_minvol, vol_minvol, _ = realized_stats(w_min, mu, cov)
+
+    w_ms = solve_max_sharpe(mu, cov)
+    mu_maxsharpe, vol_maxsharpe, _ = realized_stats(w_ms, mu, cov)
+
+    mu_at_target, vol_at_target, _ = realized_stats(w, mu, cov)
+
+    mu_current = vol_current = None
+    if current_w is not None and len(current_w) == len(mu.index):
+        mu_current, vol_current, _ = realized_stats(current_w, mu, cov)
+
     png_path = plot_frontier_pretty(
-        returns_path=args.returns_file if hasattr(args,
-                                                  "returns_file") and args.returns_file else "returns/sleeve_returns.csv",
-        frontier_vols=vols_on_grid,
-        frontier_rets=rets_on_grid,
-        mu_target=mu_at_target,
-        vol_target=vol_at_target,
-        mu_current=mu_current,
-        vol_current=vol_current,
-        mu_minvol=mu_minvol,
-        vol_minvol=vol_minvol,
-        mu_maxsharpe=mu_maxsharpe,
-        vol_maxsharpe=vol_maxsharpe,
+        returns_path=args.returns_file or "returns/sleeve_returns.csv",
+        frontier_vols=vols_on_grid,  # decimals
+        frontier_rets=rets_on_grid,  # decimals
+        mu_target=mu_at_target / 100.0,  # decimals
+        vol_target=vol_at_target / 100.0,
+        mu_current=(mu_current / 100.0) if mu_current is not None else None,
+        vol_current=(vol_current / 100.0) if vol_current is not None else None,
+        mu_minvol=mu_minvol / 100.0,
+        vol_minvol=vol_minvol / 100.0,
+        mu_maxsharpe=mu_maxsharpe / 100.0,
+        vol_maxsharpe=vol_maxsharpe / 100.0,
         scenario_name="Base",
-        outputs_dir="outputs",
+        outputs_dir=str(OUTPUT_DIR),
     )
     print(f"Saved efficient frontier chart: {png_path}")
 
