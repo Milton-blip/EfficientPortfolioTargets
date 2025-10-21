@@ -128,8 +128,12 @@ def plot_frontier_pretty(
     title = f"Efficient Frontier + 8% Target ({scenario_name}, {label_nv})"
     plt.title(title, fontsize=18, pad=12)
 
-    lg = plt.legend(framealpha=0.9, facecolor="white", edgecolor="#cccccc", fontsize=12)
-    for lh in lg.legendHandles:
+    lg = plt.legend(
+        framealpha=0.9, facecolor="white", edgecolor="#cccccc", fontsize=12
+    )
+    # --- robust handle access across Matplotlib versions ---
+    handles = getattr(lg, "legend_handles", None) or getattr(lg, "legendHandles", [])
+    for lh in handles:
         if hasattr(lh, "set_linewidth"):
             lh.set_linewidth(2.0)
 
