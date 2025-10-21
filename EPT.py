@@ -1,440 +1,376 @@
 #!/usr/bin/env python3
 import argparse
+import sys
 import json
-import os
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import cvxpy as cp
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# -----------------------------
-# Paths / Output utilities
-# -----------------------------
-ROOT = Path(__file__).resolve().parent
-OUTDIR = ROOT / "outputs"                     # CHANGED: outputs/
-RETURNS_DEFAULT = ROOT / "returns" / "sleeve_returns.csv"
-OUTDIR.mkdir(parents=True, exist_ok=True)
 
-def _ts() -> str:
-    return datetime.now().strftime("%Y-%m-%d_%H%M%S")
+# ---------- Utilities ----------
 
-def write_csv(df: pd.DataFrame, name: str) -> Path:
-    p = OUTDIR / f"{name}"
-    df.to_csv(p, index=True)
-    return p
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
-def write_json(obj, name: str) -> Path:
-    p = OUTDIR / f"{name}"
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(
-            obj,
-            f,
-            indent=2,
-            default=lambda x: float(x) if isinstance(x, (np.floating,)) else x,
-        )
-    return p
 
-# -----------------------------
-# Sleeve mapping / inference
-# -----------------------------
-# Minimal pragmatic map. Add as you see fit.
-SYMBOL_TO_SLEEVE: Dict[str, str] = {
-    # Cash / MMF
-    "SPAXX": "Cash", "VMFXX": "Cash", "BIL": "Cash", "SGOV": "Treasuries",
-    # Treasuries
-    "SHY": "Treasuries", "VGSH": "Treasuries", "IEF": "Treasuries", "TLT": "Treasuries", "SPTL": "Treasuries",
-    # TIPS
-    "TIP": "TIPS", "SCHP": "TIPS", "VTIP": "TIPS",
-    # US Core
-    "VTI": "US_Core", "ITOT": "US_Core", "SCHB": "US_Core", "VOO": "US_Core", "IVV": "US_Core",
-    # US Value / Growth / Small Value
-    "VTV": "US_Value", "IWD": "US_Value",
-    "IVW": "US_Growth", "VUG": "US_Growth",
-    "VBR": "US_SmallValue", "VIOV": "US_SmallValue", "AVUV": "US_SmallValue",
-    # Intl Developed
-    "VEA": "Intl_DM", "IEFA": "Intl_DM",
-    # Emerging
-    "VWO": "EM", "IEMG": "EM",
-    # IG Core Bonds
-    "AGG": "IG_Core", "BND": "IG_Core",
-    # Energy (example)
-    "XLE": "Energy",
-    # Hedged intl IG (optional)
-    "BNDX": "IG_Intl_Hedged",
-}
-
-NAME_CUES: List[Tuple[str, str]] = [
-    ("MONEY MARKET", "Cash"),
-    ("TREAS", "Treasuries"),
-    ("TIPS", "TIPS"),
-    ("VALUE", "US_Value"),
-    ("GROWTH", "US_Growth"),
-    ("SMALL", "US_SmallValue"),
-    ("EMERGING", "EM"),
-    ("INTL", "Intl_DM"),
-    ("INTERNATIONAL", "Intl_DM"),
-    ("AGG", "IG_Core"),
-    ("CORE BOND", "IG_Core"),
-    ("ENERGY", "Energy"),
-    ("ILLQ", "Illiquid_Automattic"),
-]
-
-def infer_sleeve(symbol: str, name: str) -> str:
-    s = str(symbol or "").upper().strip()
-    n = str(name or "").upper().strip()
-    if s in SYMBOL_TO_SLEEVE:
-        return SYMBOL_TO_SLEEVE[s]
-    for cue, sleeve in NAME_CUES:
-        if cue in n:
-            return sleeve
-    # default equity core if unknown
-    return "US_Core"
-
-# -----------------------------
-# Holdings & returns ingest
-# -----------------------------
-def load_holdings(path: Path) -> Tuple[pd.DataFrame, pd.Series]:
-    df = pd.read_csv(path)
-
-    # New schema you provided:
-    # Symbol,Name,Account,TaxStatus,Quantity,PricePerShare,MarketValue,
-    # CostPerShare,TotalCost,Sleeve,Tradable,Notes
-    req = ["Symbol", "Name", "Quantity", "PricePerShare", "MarketValue", "Sleeve"]
-    missing = [c for c in req if c not in df.columns]
-    if missing:
-        raise SystemExit(f"[ERROR] Holdings missing required columns: {missing}")
-
-    # Ensure numeric
-    for c in ["Quantity", "PricePerShare", "MarketValue"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-
-    # Sleeve fill: use existing if present, otherwise infer
-    sleeves = df["Sleeve"].astype(object)
-    mask = sleeves.isna() | (sleeves.astype(str).str.strip() == "")
-    if mask.any():
-        inferred = [
-            infer_sleeve(sym, nm) if m else sleeves.iloc[i]
-            for i, (m, sym, nm) in enumerate(
-                zip(mask.tolist(), df["Symbol"].tolist(), df["Name"].tolist())
-            )
-        ]
-        sleeves.loc[mask] = inferred
-    df["Sleeve"] = sleeves.astype(str)
-
-    # Total sleeve dollars from actual market value
-    sleeve_val = df.groupby("Sleeve")["MarketValue"].sum().replace({np.nan: 0.0})
-    total = float(sleeve_val.sum())
-    if total <= 0:
-        raise SystemExit("[ERROR] Holdings have zero total MarketValue.")
-
-    sleeve_weights = sleeve_val / total
-    return df, sleeve_weights
-
-def load_returns(path: Path) -> pd.DataFrame:
+def load_csv_required(path: Path, desc: str) -> pd.DataFrame:
     if not path.exists():
-        raise SystemExit(
-            "[ERROR] Could not find returns file.\n"
-            "Place a CSV like:\n"
-            "  returns/sleeve_returns.csv\n"
-            "with columns: Date,<sleeve1>,<sleeve2>,...\n"
-            "Each column should be period returns (e.g., monthly decimal returns)."
+        print(f"[ERROR] Could not find {desc}. Expected at: {path}")
+        sys.exit(1)
+    try:
+        return pd.read_csv(path)
+    except Exception as e:
+        print(f"[ERROR] Failed reading {desc} at {path}: {e}")
+        sys.exit(1)
+
+
+# ---------- Sleeve map & assignment ----------
+
+def load_sleeve_map(path: Path) -> pd.DataFrame | None:
+    """
+    Load portfolio_data/sleeve_map.csv if present.
+    Expected columns: Symbol, Sleeve
+    """
+    if not path.exists():
+        print(f"[WARN] Sleeve map not found at {path}. Will rely on existing 'Sleeve' values in holdings.")
+        return None
+    df = pd.read_csv(path)
+    needed = {"Symbol", "Sleeve"}
+    missing = needed.difference(df.columns)
+    if missing:
+        print(f"[ERROR] sleeve_map.csv is missing columns: {sorted(missing)}")
+        sys.exit(1)
+    df = df.copy()
+    df["Symbol"] = df["Symbol"].astype(str).str.upper().str.strip()
+    df["Sleeve"] = df["Sleeve"].astype(str).str.strip()
+    return df
+
+
+def assign_sleeves(holdings: pd.DataFrame, sleeve_map: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    If holdings['Sleeve'] is null/empty, fill from sleeve_map (by Symbol).
+    """
+    df = holdings.copy()
+
+    # Normalize symbol and sleeve fields
+    if "Symbol" not in df.columns:
+        print("[ERROR] Holdings missing required column: 'Symbol'")
+        sys.exit(1)
+
+    df["Symbol"] = df["Symbol"].astype(str).str.upper().str.strip()
+
+    if "Sleeve" not in df.columns:
+        df["Sleeve"] = ""
+
+    # Treat empty strings as NaN for fill logic, then restore strings
+    df["Sleeve"] = df["Sleeve"].astype(str)
+    df["Sleeve"] = df["Sleeve"].replace({"": np.nan})
+
+    if sleeve_map is not None:
+        sym_to_sleeve = (
+            sleeve_map
+            .dropna(subset=["Symbol", "Sleeve"])
+            .drop_duplicates(subset=["Symbol"])
+            .set_index("Symbol")["Sleeve"]
+            .to_dict()
         )
-    r = pd.read_csv(path)
+        need_fill = df["Sleeve"].isna()
+        if need_fill.any():
+            df.loc[need_fill, "Sleeve"] = df.loc[need_fill, "Symbol"].map(sym_to_sleeve)
 
-    # Expect wide format: Date, Sleeve1, Sleeve2, ...
-    # Drop Date if present
-    if "Date" in r.columns:
-        r = r.drop(columns=["Date"])
+    # Any still missing → set to NaN (exclude later if no returns exist)
+    df["Sleeve"] = df["Sleeve"].where(~df["Sleeve"].isna(), np.nan)
 
-    # Coerce to numeric
-    r = r.apply(pd.to_numeric, errors="coerce")
+    return df
 
-    # Drop columns that are entirely NaN
-    r = r.dropna(axis=1, how="all")
-    # Drop rows with all NaN
-    r = r.dropna(axis=0, how="all")
+
+# ---------- Data normalization ----------
+
+def compute_holdings_weights_by_sleeve(holdings: pd.DataFrame) -> pd.Series:
+    """
+    Aggregate holdings by Sleeve (using MarketValue if present, else Quantity*PricePerShare),
+    then convert to weight per sleeve (sum=1).
+    """
+    df = holdings.copy()
+
+    for col in ["Quantity", "PricePerShare", "MarketValue"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # compute MarketValue if missing or invalid
+    mv = df["MarketValue"].astype(float)
+    if mv.isna().all() or (mv <= 0).all():
+        # try compute from quantity*price
+        q = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0.0)
+        p = pd.to_numeric(df["PricePerShare"], errors="coerce").fillna(0.0)
+        df["MarketValue"] = q * p
+    else:
+        df["MarketValue"] = pd.to_numeric(df["MarketValue"], errors="coerce").fillna(0.0)
+
+    # require Sleeve for grouping
+    if "Sleeve" not in df.columns:
+        print("[ERROR] Holdings missing 'Sleeve' column after assignment.")
+        sys.exit(1)
+
+    # Exclude rows with no sleeve or zero/negative MV
+    df = df.dropna(subset=["Sleeve"])
+    df = df[df["MarketValue"] > 0]
+
+    if df.empty:
+        print("[ERROR] No valid (Sleeve, MarketValue) rows in holdings after cleaning.")
+        sys.exit(1)
+
+    sleeve_mv = df.groupby("Sleeve")["MarketValue"].sum()
+    total_mv = sleeve_mv.sum()
+    if total_mv <= 0:
+        print("[ERROR] Total MarketValue is zero or negative after cleaning.")
+        sys.exit(1)
+
+    return (sleeve_mv / total_mv).sort_index()
+
+
+def load_returns_wide(path: Path) -> pd.DataFrame:
+    """
+    Returns CSV in wide format: Date, <Sleeve1>, <Sleeve2>, ...
+    """
+    r = load_csv_required(path, "returns file")
+    if "Date" not in r.columns:
+        print("[ERROR] Returns file must have a 'Date' column.")
+        sys.exit(1)
+    # ensure numeric for sleeves
+    for c in r.columns:
+        if c == "Date":
+            continue
+        r[c] = pd.to_numeric(r[c], errors="coerce")
+    # drop rows that are all-NaN across sleeves
+    value_cols = [c for c in r.columns if c != "Date"]
+    r = r.dropna(subset=value_cols, how="all")
+    if r.empty:
+        print("[ERROR] Returns file has no usable rows after cleanup.")
+        sys.exit(1)
     return r
 
-def normalize_inputs(
-    holdings_w: pd.Series,
-    returns_df: pd.DataFrame
-) -> Tuple[pd.Series, pd.Series, pd.DataFrame]:
-    # Overlap sleeves
-    sleeves_h = set(holdings_w.index)
-    sleeves_r = set(returns_df.columns)
-    overlap = sorted(sleeves_h.intersection(sleeves_r))
+
+def align_to_overlap(holdings_w: pd.Series, returns_wide: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.DataFrame]:
+    """
+    Keep only sleeves that exist in both holdings weights and returns columns.
+    Return (mu, holdings_w_aligned, cov) where:
+      - mu: mean returns (vector) for overlapping sleeves (index match)
+      - holdings_w_aligned: holdings weights restricted to overlapping sleeves and renormalized
+      - cov: covariance matrix for overlapping sleeves (index/columns match)
+    """
+    sleeves_returns = [c for c in returns_wide.columns if c != "Date"]
+    sleeves_holdings = list(holdings_w.index)
+
+    overlap = sorted(set(sleeves_returns).intersection(sleeves_holdings))
     if not overlap:
-        dbg = {
-            "holdings_sleeves": sorted(list(sleeves_h)),
-            "returns_sleeves": sorted(list(sleeves_r)),
+        print("[WARN] After normalization, no sleeves overlap between holdings and returns.")
+        debug = {
+            "holdings_sleeves": sleeves_holdings,
+            "returns_sleeves": sleeves_returns
         }
-        write_json(dbg, "debug_no_overlap.json")
-        raise SystemExit(
-            "[WARN] After normalization, no sleeves overlap between holdings and returns.\n"
-            "      Wrote debugging info to outputs/debug_no_overlap.json"
-        )
+        Path("debug_no_overlap.json").write_text(json.dumps(debug, indent=2))
+        sys.exit(1)
 
-    # Filter and renorm holdings to overlap
-    h = holdings_w.reindex(overlap).fillna(0.0)
-    total = float(h.sum())
-    if total <= 0:
-        # if all zero in overlap, put equal weights over overlap
-        h = pd.Series(1.0 / len(overlap), index=overlap)
+    R = returns_wide[overlap].dropna(how="all")
+    # remove columns that are entirely NaN just in case
+    all_nan_cols = [c for c in overlap if R[c].notna().sum() == 0]
+    if all_nan_cols:
+        print(f"[NOTE] Excluding sleeves with no return history from stats: {all_nan_cols}")
+        keep = [c for c in overlap if c not in all_nan_cols]
+        if not keep:
+            print("[ERROR] No sleeves remain after excluding empty return columns.")
+            sys.exit(1)
+        overlap = keep
+        R = returns_wide[overlap].dropna(how="all")
 
-    # Returns subset
-    R = returns_df[overlap].dropna(how="any")
+    mu = R.mean().astype(float)
+    cov = R.cov().astype(float)
 
-    # Stats
-    mu = R.mean()      # arithmetic mean per period
-    cov = R.cov()
-    return h, mu, cov
+    # align holdings weights and renormalize on overlap
+    w = holdings_w.reindex(overlap).fillna(0.0)
+    if w.sum() <= 0:
+        # if all were zero (e.g., holdings all in sleeves lacking returns), fall back to uniform
+        w = pd.Series(1.0 / len(overlap), index=overlap)
+    else:
+        w = w / w.sum()
 
-# -----------------------------
-# Optimization (convex)
-# Efficient-frontier bisection:
-# minimize variance subject to return >= r,
-# then bisection on r to hit target variance.
-# -----------------------------
-def min_variance_with_return(
-    mu: pd.Series,
-    cov: pd.DataFrame,
-    r_target: float,
-    wmin: float,
-    wmax: float,
-    w0: pd.Series | None = None
-) -> Tuple[np.ndarray, float]:
-    cols = mu.index.tolist()
-    n = len(cols)
-    Sigma = cov.values
+    return mu, w, cov
 
-    # PSD guard: small jitter (helps OSQP/SCS; keeps convexity)
-    eps = 1e-10
-    Sigma = Sigma + eps * np.eye(n)
 
+# ---------- Optimization ----------
+
+def solve_max_return_at_vol(mu: pd.Series,
+                            cov: pd.DataFrame,
+                            target_vol: float,
+                            current_w: pd.Series | None = None,
+                            max_weight: float | None = None,
+                            min_weight: float | None = None,
+                            l2_to_current: float | None = None) -> pd.Series:
+    """
+    Maximize mu^T w subject to:
+      1) sum(w) = 1, w >= 0
+      2) w^T cov w <= (target_vol)^2
+      3) optional bounds and L2 penalty to current weights (convex)
+    """
+    sleeves = list(mu.index)
+    n = len(sleeves)
+    if cov.shape != (n, n):
+        cov = cov.reindex(index=sleeves, columns=sleeves).fillna(0.0)
+
+    Q = cov.values
+    m = mu.values
     w = cp.Variable(n, nonneg=True)
-    objective = cp.quad_form(w, Sigma)
-    cons = [
-        cp.sum(w) == 1.0,
-        mu.values @ w >= r_target,
-    ]
-    if wmin is not None:
-        cons.append(w >= float(wmin))
-    if wmax is not None:
-        cons.append(w <= float(wmax))
 
-    prob = cp.Problem(cp.Minimize(objective), cons)
+    obj = cp.Maximize(m @ w)
 
-    solved = False
-    for solver in (cp.OSQP, cp.SCS, cp.ECOS):
+    cons = [cp.sum(w) == 1, cp.quad_form(w, Q) <= float(target_vol) ** 2]
+
+    if max_weight is not None:
+        cons.append(w <= float(max_weight))
+    if min_weight is not None:
+        cons.append(w >= float(min_weight))
+
+    reg = 0
+    if l2_to_current is not None and current_w is not None:
+        cur = current_w.reindex(sleeves).fillna(0.0).values
+        reg = float(l2_to_current) * cp.sum_squares(w - cur)
+
+    prob = cp.Problem(cp.Maximize(m @ w - reg), cons)
+    # Prefer ECOS or OSQP; fallback to SCS
+    try:
+        prob.solve(solver=cp.ECOS, verbose=False, max_iters=20000)
+    except Exception:
         try:
-            prob.solve(solver=solver, verbose=False, max_iters=20000)
-            if w.value is not None:
-                solved = True
-                break
+            prob.solve(solver=cp.OSQP, verbose=False, max_iter=40000)
         except Exception:
-            continue
+            prob.solve(solver=cp.SCS, verbose=False, max_iters=40000)
 
-    if not solved or w.value is None:
-        raise RuntimeError("Min-variance QP failed to solve.")
+    if w.value is None:
+        print("[ERROR] Optimization failed to produce a solution.")
+        sys.exit(1)
 
-    wv = np.clip(w.value, 0, None)
-    s = float(wv.sum())
-    if s <= 0:
-        raise RuntimeError("Invalid weights solution (sum <= 0).")
-    wv = wv / s
+    sol = pd.Series(np.maximum(w.value, 0.0), index=sleeves)
+    if sol.sum() <= 0:
+        print("[ERROR] Optimizer returned all-zero weights.")
+        sys.exit(1)
+    sol = sol / sol.sum()
+    return sol
 
-    var = float(wv.T @ Sigma @ wv)
-    return wv, var
 
-def frontier_at_vol(
-    mu: pd.Series,
-    cov: pd.DataFrame,
-    target_vol: float,
-    wmin: float | None,
-    wmax: float | None
-) -> np.ndarray:
-    """Find weights whose variance hits target_vol^2 (within tolerance) via bisection on expected return."""
-    # Lower bound return: min-variance portfolio return
-    w_minvar, var_min = min_variance_with_return(
-        mu, cov, r_target=-1e9, wmin=wmin, wmax=wmax
-    )
-    r_low = float(mu.values @ w_minvar)
+# ---------- Reporting & plots ----------
 
-    # Upper bound return: maximum component return allowed by bounds
-    r_high = float(mu.max())
-    target_var = float(target_vol ** 2)
+def print_report(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame):
+    exp_ret = float(mu.reindex(weights.index).fillna(0.0).values @ weights.values)
+    vol = float(np.sqrt(weights.values @ cov.reindex(index=weights.index, columns=weights.index).fillna(0.0).values @ weights.values))
+    sharpe = exp_ret / vol if vol > 0 else np.nan
 
-    # If min-var already above the risk budget, tighten with bounds or accept if cannot do lower
-    if var_min > target_var:
-        # Can’t reduce risk further under current bounds; return min-var
-        return w_minvar
-
-    best_w = w_minvar
-    best_diff = abs(var_min - target_var)
-
-    for _ in range(35):
-        r_mid = 0.5 * (r_low + r_high)
-        w_mid, var_mid = min_variance_with_return(
-            mu, cov, r_target=r_mid, wmin=wmin, wmax=wmax
-        )
-        diff = var_mid - target_var
-        if abs(diff) < best_diff:
-            best_diff = abs(diff)
-            best_w = w_mid
-        # If we can afford more return (variance below target), move r_low up
-        if var_mid <= target_var:
-            r_low = r_mid
-        else:
-            r_high = r_mid
-
-    return best_w
-
-# -----------------------------
-# Plotting: efficient frontier PNG
-# -----------------------------
-def render_frontier_png(
-    mu: pd.Series,
-    cov: pd.DataFrame,
-    tag: str,
-    targets: List[float] | None = None
-) -> Path:
-    """
-    Sample a set of target vols, compute frontier points, and save a PNG under outputs/.
-    """
-    if targets is None:
-        # a smooth set across 5%..20% vol
-        targets = [x / 100.0 for x in range(5, 21, 1)]
-
-    xs = []  # vol
-    ys = []  # expected return
-    for tv in targets:
-        try:
-            w = frontier_at_vol(mu, cov, tv, wmin=None, wmax=None)
-            exp = float(mu.values @ w)
-            vol = float(np.sqrt(w @ cov.values @ w))
-            xs.append(vol)
-            ys.append(exp)
-        except Exception:
-            # skip unsolved points
-            continue
-
-    if not xs:
-        # nothing to plot
-        return OUTDIR / f"frontier_{tag}_{_ts()}.png"  # still return a path
-
-    plt.figure(figsize=(7, 5), dpi=150)
-    plt.plot([v * 100 for v in xs], [r * 100 for r in ys], marker="o", lw=1.5, ms=3)
-    plt.xlabel("Volatility (%)")
-    plt.ylabel("Expected Return (%)")
-    plt.title(f"Efficient Frontier — {tag}")
-    plt.grid(True, alpha=0.3)
-    outpath = OUTDIR / f"frontier_{tag}_{_ts()}.png"
-    plt.tight_layout()
-    plt.savefig(outpath)
-    plt.close()
-    return outpath
-
-# -----------------------------
-# Pretty printing
-# -----------------------------
-def fmt_pct(x: float) -> str:
-    return f"{x*100:.2f}"
-
-def print_results(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame, tag: str):
-    w = weights.reindex(mu.index).fillna(0.0)
-    exp = float(mu.values @ w.values)
-    vol = float(np.sqrt(w.values @ cov.values @ w.values))
-    sharpe = exp / vol if vol > 0 else np.nan
-
+    dfw = (weights * 100).to_frame("Weight%").sort_values("Weight%", ascending=False)
     print("\nWeights (%):")
-    out = (w * 100).rename("Weight%").sort_values(ascending=False).to_frame()
-    print(out.to_string())
+    print(dfw.to_string(float_format=lambda x: f"{x:0.2f}"))
 
-    print(f"\nExpected Return %: {fmt_pct(exp)}")
-    print(f"Volatility %: {fmt_pct(vol)}")
-    print(f"Sharpe: {sharpe:.2f}")
+    print(f"\nExpected Return %: {exp_ret*100:0.2f}")
+    print(f"Volatility %: {vol*100:0.2f}")
+    if np.isfinite(sharpe):
+        print(f"Sharpe: {sharpe:0.2f}")
+    else:
+        print("Sharpe: n/a")
 
-    # Correlation
-    std = np.sqrt(np.diag(cov.values))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        corr = cov.values / np.outer(std, std)
-    corr_df = pd.DataFrame(corr, index=cov.index, columns=cov.columns)
-    print("\nCorrelation matrix:")
-    print(corr_df.round(2).to_string())
+    # mean returns by sleeve (period), just to aid sanity-checks
+    print("\nMean period returns by sleeve (%), descending:")
+    print((mu.sort_values(ascending=False) * 100).round(3))
 
-    # Write artifacts
-    ts = _ts()
-    weights_path = write_csv(out, f"weights_{tag}_{ts}.csv")
-    corr_path = write_csv(corr_df.round(6), f"corr_{tag}_{ts}.csv")
-    meta = {
-        "timestamp": ts,
-        "tag": tag,
-        "expected_return": exp,
-        "volatility": vol,
-        "sharpe": sharpe,
-        "target_hit_note": "Bisection on return to achieve target variance boundary.",
-        "weights_csv": str(weights_path),
-        "correlation_csv": str(corr_path),
-    }
-    write_json(meta, f"run_{tag}_{ts}.json")
 
-# -----------------------------
-# CLI
-# -----------------------------
+def save_outputs(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame, outputs_dir: Path):
+    ensure_dir(outputs_dir)
+
+    # 1) weights CSV
+    (weights.to_frame("weight")
+     .to_csv(outputs_dir / "weights.csv", index=True))
+
+    # 2) correlation heatmap
+    corr = cov.reindex(index=weights.index, columns=weights.index).fillna(0.0)
+    d = np.sqrt(np.diag(cov.reindex(index=weights.index, columns=weights.index).fillna(0.0).values))
+    d[d == 0] = 1.0
+    Dinv = np.diag(1.0 / d)
+    corr = pd.DataFrame(Dinv @ cov.reindex(index=weights.index, columns=weights.index).fillna(0.0).values @ Dinv,
+                        index=weights.index, columns=weights.index)
+    plt.figure(figsize=(8, 6))
+    im = plt.imshow(corr.values, cmap="coolwarm", vmin=-1, vmax=1)
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks(range(len(corr.columns)), corr.columns, rotation=45, ha="right")
+    plt.yticks(range(len(corr.index)), corr.index)
+    plt.title("Sleeve Correlation")
+    plt.tight_layout()
+    plt.savefig(outputs_dir / "correlation.png", dpi=160)
+    plt.close()
+
+    # 3) weights bar plot
+    plt.figure(figsize=(8, 5))
+    (weights.sort_values(ascending=False) * 100.0).plot(kind="bar")
+    plt.ylabel("Weight (%)")
+    plt.title("Optimized Sleeve Weights")
+    plt.tight_layout()
+    plt.savefig(outputs_dir / "weights.png", dpi=160)
+    plt.close()
+
+
+# ---------- CLI / Main ----------
+
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Efficient frontier optimizer on sleeves (outputs saved under outputs/).",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    p = argparse.ArgumentParser(description="EfficientPortfolioTargets — maximize expected return at a target volatility.")
     p.add_argument("--holdings", required=True, help="Path to holdings CSV.")
-    p.add_argument("--returns-file", default=str(RETURNS_DEFAULT), help="Path to sleeve_returns.csv.")
-    p.add_argument("--target-vol", type=float, required=True, help="Target volatility (e.g., 0.08 for 8%%).")
-    p.add_argument("--max-weight", type=float, default=None, help="Per-sleeve max weight (e.g., 0.35).")
-    p.add_argument("--min-weight", type=float, default=None, help="Per-sleeve min weight (e.g., 0.00).")
-    p.add_argument("--l2-to-current", type=float, default=0.0, help="(Not used in frontier solve; reserved.)")
+    p.add_argument("--target-vol", required=True, type=float, help="Target volatility (e.g., 0.08 for 8%%).")
+    p.add_argument("--returns-file", default="returns/sleeve_returns.csv", help="Path to sleeve returns CSV.")
+    p.add_argument("--max-weight", type=float, default=None, help="Optional per-sleeve maximum weight (e.g., 0.35).")
+    p.add_argument("--min-weight", type=float, default=None, help="Optional per-sleeve minimum weight (e.g., 0.00).")
+    p.add_argument("--l2-to-current", type=float, default=None, help="Optional L2 penalty strength to current weights (e.g., 0.25).")
+    p.add_argument("--outputs-dir", default="outputs", help="Directory to write outputs into.")
     return p.parse_args()
+
 
 def main():
     args = parse_args()
-    hold_path = Path(args.holdings).resolve()
-    ret_path = Path(args.returns_file).resolve()
 
-    # Load
-    holdings_df, holdings_w = load_holdings(hold_path)
-    returns_df = load_returns(ret_path)
+    outputs_dir = Path(args.outputs_dir)
+    ensure_dir(outputs_dir)
 
-    # Normalize by overlap
-    current_w, mu, cov = normalize_inputs(holdings_w, returns_df)
+    holdings_path = Path(args.holdings)
+    returns_path = Path(args.returns_file)
+    sleeve_map_path = Path("portfolio_data/sleeve_map.csv")
 
-    # Solve for weights that lie on the efficient frontier at target vol
-    w_arr = frontier_at_vol(
-        mu, cov,
+    # Load inputs
+    holdings_raw = load_csv_required(holdings_path, "holdings file")
+    sleeve_map = load_sleeve_map(sleeve_map_path)
+    holdings = assign_sleeves(holdings_raw, sleeve_map)
+
+    # Compute holdings weights by sleeve
+    current_w = compute_holdings_weights_by_sleeve(holdings)
+
+    # Load returns and align to overlap
+    returns_wide = load_returns_wide(returns_path)
+    mu, w_aligned, cov = align_to_overlap(current_w, returns_wide)
+
+    # Solve optimization
+    weights = solve_max_return_at_vol(
+        mu=mu,
+        cov=cov,
         target_vol=float(args.target_vol),
-        wmin=args.min_weight,
-        wmax=args.max_weight
+        current_w=w_aligned,
+        max_weight=args.max_weight,
+        min_weight=args.min_weight,
+        l2_to_current=args.l2_to_current
     )
-    w_series = pd.Series(w_arr, index=mu.index)
 
-    # Print & write
-    tag = f"targetVol_{args.target_vol:.2f}"
-    print_results(w_series, mu, cov, tag=tag)
+    # Report and outputs
+    print_report(weights, mu, cov)
+    save_outputs(weights, mu, cov, outputs_dir=outputs_dir)
 
-    # PNG: efficient frontier curve
-    png_path = render_frontier_png(mu, cov, tag=tag)
-    print(f"\nFrontier PNG: {png_path}")
-
-    # Validator tolerance check
-    realized_vol = float(np.sqrt(w_series.values @ cov.values @ w_series.values))
-    diff = abs(realized_vol - float(args.target_vol))
-    if diff > 0.005:  # ±0.5% absolute vol tolerance
-        print(
-            f"\n[WARN] Achieved vol {fmt_pct(realized_vol)} differs from target {fmt_pct(args.target_vol)} "
-            f"by {fmt_pct(diff)}. Tighten bounds/returns if you need closer matching."
-        )
 
 if __name__ == "__main__":
     main()
