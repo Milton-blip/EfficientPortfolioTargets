@@ -33,6 +33,36 @@ def _resolve_return_label(return_type_opt: Optional[str], returns_path: str) -> 
         return "Real" if return_type_opt.lower() == "real" else "Nominal"
     return _infer_returns_label(returns_path)
 
+def to_real_returns(returns_df: pd.DataFrame, inflation_col: Optional[str] = None) -> pd.DataFrame:
+    """
+    Convert sleeve returns to REAL using (1+r)/(1+pi) - 1 per period.
+    Expects returns_df columns: Date + sleeve columns, and an inflation column if available.
+    If inflation_col is None, will try to find one named 'Inflation' or 'CPI' (case-insensitive).
+    """
+    df = returns_df.copy()
+    cols = [c for c in df.columns if c.lower() not in {"date"}]
+
+    # Find inflation column if not specified
+    if inflation_col is None:
+        for cand in df.columns:
+            lc = cand.lower()
+            if lc in {"inflation", "cpi"}:
+                inflation_col = cand
+                break
+
+    if inflation_col is None or inflation_col not in df.columns:
+        print("[WARN] No inflation column found; Real returns cannot be computed. Using nominal returns.")
+        return df
+
+    pi = pd.to_numeric(df[inflation_col], errors="coerce").fillna(0.0)
+    sleeve_cols = [c for c in df.columns if c not in {"Date", inflation_col}]
+
+    for c in sleeve_cols:
+        r = pd.to_numeric(df[c], errors="coerce")
+        df[c] = (1.0 + r) / (1.0 + pi) - 1.0
+
+    return df
+
 def plot_frontier_pretty(
     returns_path,
     frontier_vols,
@@ -349,6 +379,48 @@ def realized_stats(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame):
     sharpe = exp_ret / vol if vol > 0 else np.nan
     return exp_ret, vol, sharpe
 
+def frontier_by_gamma(
+    mu: pd.Series,
+    cov: pd.DataFrame,
+    gamma_grid: np.ndarray,
+    max_weight: Optional[float] = None,
+    min_weight: Optional[float] = None,
+) -> tuple[list, list]:
+    """
+    Trace the efficient frontier by sweeping risk aversion γ in:
+        max_w  mu·w - γ * w'Σw  s.t. 1'w=1, w>=0, (bounds)
+    Returns vols and rets in DECIMALS for plotting.
+    """
+    n = len(mu)
+    w = cp.Variable(n)
+    mu_vec = mu.values / 100.0
+    cov_mat = cov.values
+    cons = [cp.sum(w) == 1, w >= 0]
+    if max_weight is not None:
+        cons.append(w <= max_weight)
+    if min_weight is not None:
+        cons.append(w >= min_weight)
+
+    vols, rets = [], []
+    for g in gamma_grid:
+        obj = cp.Maximize(mu_vec @ w - float(g) * cp.quad_form(w, cov_mat))
+        prob = cp.Problem(obj, cons)
+        _solve_with_robust_settings(prob)
+        if w.value is None:
+            continue
+        ww = np.clip(w.value, 0, None)
+        ww = ww / ww.sum()
+        ws = pd.Series(ww, index=mu.index)
+        r_pct, v_pct, _ = realized_stats(ws, mu, cov)
+        rets.append(r_pct / 100.0)  # decimals
+        vols.append(v_pct / 100.0)  # decimals
+
+    if not vols:
+        return [], []
+
+    df = pd.DataFrame({"vol": vols, "ret": rets}).sort_values("vol").drop_duplicates("vol", keep="last")
+    df["ret"] = df["ret"].cummax()   # upper envelope removes wiggles
+    return df["vol"].tolist(), df["ret"].tolist()
 
 def plot_frontier(
     mu: pd.Series,
@@ -493,6 +565,10 @@ def main():
 
     try:
         returns_df = load_returns(Path(args.returns_file))
+        # Convert to real returns if requested
+        ret_label = _resolve_return_label(getattr(args, "return_type", None), args.returns_file)
+        if ret_label == "Real":
+            returns_df = to_real_returns(returns_df, inflation_col=None)  # auto-detect 'Inflation'/'CPI'
     except FileNotFoundError:
         if args.auto_regen:
             auto_generate_returns_if_needed(args, sleeves_in_holdings)
@@ -531,33 +607,15 @@ def main():
 
     print_results(w, mu.reindex(w.index), cov.reindex(index=w.index, columns=w.index), args.target_vol, ret_label)
 
-    # --- build frontier grid and key points for pretty plot (DECIMAL inputs for pretty plot) ---
-    vols_on_grid, rets_on_grid = [], []
-    grid = np.linspace(
-        max(0.0025, 0.35 * float(args.target_vol)),
-        max(float(args.target_vol) * 2.0, float(args.target_vol) + 0.05),
-        100,  # denser grid for smoother curve
+    # --- build frontier via gamma-sweep for a smooth/convex curve (inputs to pretty plot are DECIMALS) ---
+    gamma_grid = np.logspace(-1, 3, 120)  # sweep risk aversion over several orders
+    vols_on_grid, rets_on_grid = frontier_by_gamma(
+        mu.reindex(common),
+        cov.reindex(index=common, columns=common),
+        gamma_grid=gamma_grid,
+        max_weight=args.max_weight,
+        min_weight=args.min_weight,
     )
-
-    pts = []
-    for tv in grid:
-        try:
-            w_tv = solve_max_return_at_vol(mu, cov, tv)
-            r_tv, v_tv, _ = realized_stats(w_tv, mu, cov)  # percent units
-            pts.append((v_tv, r_tv))  # store as (vol%, ret%)
-        except Exception:
-            pass
-
-    if pts:
-        df_front = pd.DataFrame(pts, columns=["vol_pct", "ret_pct"]).dropna()
-        df_front = df_front.sort_values("vol_pct").drop_duplicates(subset=["vol_pct"], keep="last")
-        # enforce convex-looking, nondecreasing frontier: upper envelope
-        df_front["ret_pct"] = df_front["ret_pct"].cummax()
-        # convert to decimals for plotting function
-        vols_on_grid = (df_front["vol_pct"] / 100.0).tolist()
-        rets_on_grid = (df_front["ret_pct"] / 100.0).tolist()
-    else:
-        vols_on_grid, rets_on_grid = [], []
 
     # Key points (percent from realized_stats → convert to decimals for pretty plot)
     w_min = solve_min_variance(cov)
