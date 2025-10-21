@@ -55,6 +55,8 @@ def to_real_returns(returns_df: pd.DataFrame, inflation_col: Optional[str] = Non
         return df
 
     pi = pd.to_numeric(df[inflation_col], errors="coerce").fillna(0.0)
+    print(f"[INFO] Using inflation column '{inflation_col}'. "
+          f"Avg per-period inflation: {float(pi.mean())*100:.3f}%")
     sleeve_cols = [c for c in df.columns if c not in {"Date", inflation_col}]
 
     for c in sleeve_cols:
@@ -161,7 +163,8 @@ def plot_frontier_pretty(
         )
 
     plt.xlabel("Volatility (%)", fontsize=13)
-    plt.ylabel("Expected Return (%)", fontsize=13)
+    # Label y-axis with Nominal/Real
+    plt.ylabel(f"Expected Return ({label_nv}) (%)", fontsize=13)
 
     title = f"Efficient Frontier + 8% Target ({scenario_name}, {label_nv})"
     plt.title(title, fontsize=18, pad=12)
@@ -467,7 +470,7 @@ def plot_frontier(
         ax.scatter([cur_v], [cur_r], s=40, color="red", label="Current")
 
     ax.set_xlabel("Volatility (%)")
-    ax.set_ylabel("Expected Return (%)")
+    ax.set_ylabel(f"Expected Return ({ret_type_label}) (%)")
     ax.set_title(f"Efficient Frontier + 8 percent Target (Base, {ret_type_label})")
     ax.legend(loc="best", frameon=True)
     ax.grid(False)
