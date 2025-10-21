@@ -23,4 +23,5 @@ old_output/
 # Environment / build artifacts
 .venv/
 __pycache__/
-*.pyc
+*.pycold_files/
+*.csv
