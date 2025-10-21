@@ -15,6 +15,137 @@ DEFAULT_RETURNS = PROJECT_ROOT / "returns" / "sleeve_returns.csv"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 SLEEVE_MAP_CSV = PROJECT_ROOT / "portfolio_data" / "sleeve_map.csv"
 
+
+def _infer_returns_label(returns_path: str) -> str:
+    """Return 'Nominal' or 'Real' based on filename."""
+    rp = str(returns_path).lower()
+    if "real" in rp:
+        return "Real"
+    if "nominal" in rp:
+        return "Nominal"
+    return "Nominal"
+
+
+def plot_frontier_pretty(
+    returns_path,
+    frontier_vols,
+    frontier_rets,
+    mu_target=None,
+    vol_target=None,
+    mu_current=None,
+    vol_current=None,
+    mu_minvol=None,
+    vol_minvol=None,
+    mu_maxsharpe=None,
+    vol_maxsharpe=None,
+    scenario_name="Base",
+    outputs_dir="outputs",
+):
+    """
+    Produce a frontier chart with style and labeling consistent with the
+    reference design. All returns/vols are decimal (e.g. 0.08 = 8%).
+    """
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+
+    Path(outputs_dir).mkdir(parents=True, exist_ok=True)
+    label_nv = _infer_returns_label(returns_path)
+
+    plt.figure(figsize=(9.5, 5.6), dpi=140)
+
+    # Frontier curve
+    plt.plot(
+        [v * 100 for v in frontier_vols],
+        [r * 100 for r in frontier_rets],
+        color="#0b245b",
+        linewidth=3.0,
+        label="Frontier (Automattic fixed)",
+    )
+
+    # Target vol point
+    if mu_target is not None and vol_target is not None:
+        plt.scatter(
+            vol_target * 100,
+            mu_target * 100,
+            s=150,
+            facecolors="gold",
+            edgecolors="black",
+            linewidths=1.2,
+            zorder=4,
+            label="Target 8% Vol",
+        )
+
+    # Max Sharpe
+    if mu_maxsharpe is not None and vol_maxsharpe is not None:
+        plt.scatter(
+            vol_maxsharpe * 100,
+            mu_maxsharpe * 100,
+            s=110,
+            facecolors="white",
+            edgecolors="#0b8f2f",
+            linewidths=2.0,
+            zorder=4,
+        )
+        plt.scatter(
+            vol_maxsharpe * 100,
+            mu_maxsharpe * 100,
+            s=110,
+            facecolors="#0b8f2f",
+            edgecolors="#0b8f2f",
+            linewidths=1.2,
+            zorder=4,
+            label="MaxSharpe",
+        )
+
+    # Minimum volatility point
+    if mu_minvol is not None and vol_minvol is not None:
+        plt.scatter(
+            vol_minvol * 100,
+            mu_minvol * 100,
+            s=110,
+            facecolors="#1557ff",
+            edgecolors="#0b245b",
+            linewidths=1.2,
+            zorder=4,
+            label="MinVol",
+        )
+
+    # Current portfolio
+    if mu_current is not None and vol_current is not None:
+        plt.scatter(
+            vol_current * 100,
+            mu_current * 100,
+            s=110,
+            facecolors="#d32f2f",
+            edgecolors="#8b1c1c",
+            linewidths=1.2,
+            zorder=4,
+            label="Current",
+        )
+
+    plt.xlabel("Volatility (%)", fontsize=13)
+    plt.ylabel("Expected Return (%)", fontsize=13)
+
+    title = f"Efficient Frontier + 8% Target ({scenario_name}, {label_nv})"
+    plt.title(title, fontsize=18, pad=12)
+
+    lg = plt.legend(
+        framealpha=0.9, facecolor="white", edgecolor="#cccccc", fontsize=12
+    )
+    for lh in lg.legendHandles:
+        if hasattr(lh, "set_linewidth"):
+            lh.set_linewidth(2.0)
+
+    plt.grid(True, linestyle="--", alpha=0.25)
+    plt.tight_layout()
+
+    safe_title = title.replace(" ", "_").replace(",", "").replace("(", "").replace(")", "")
+    out_png = Path(outputs_dir) / f"{safe_title}.png"
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+    return str(out_png)
+
 def ensure_outputs_dir():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -339,14 +470,23 @@ def main():
 
     print_results(w, mu.reindex(w.index), cov.reindex(index=w.index, columns=w.index), args.target_vol)
 
-    plot_frontier(
-        mu=mu.reindex(w.index),
-        cov=cov.reindex(index=w.index, columns=w.index),
-        target_w=w,
-        current_w=current_w.reindex(w.index) if len(current_w) == len(w) else None,
-        ret_type_label=args.return_type.capitalize(),
-        target_vol=float(args.target_vol),
+    png_path = plot_frontier_pretty(
+        returns_path=args.returns_file if hasattr(args,
+                                                  "returns_file") and args.returns_file else "returns/sleeve_returns.csv",
+        frontier_vols=vols_on_grid,
+        frontier_rets=rets_on_grid,
+        mu_target=mu_at_target,
+        vol_target=vol_at_target,
+        mu_current=mu_current,
+        vol_current=vol_current,
+        mu_minvol=mu_minvol,
+        vol_minvol=vol_minvol,
+        mu_maxsharpe=mu_maxsharpe,
+        vol_maxsharpe=vol_maxsharpe,
+        scenario_name="Base",
+        outputs_dir="outputs",
     )
+    print(f"Saved efficient frontier chart: {png_path}")
 
     snapshot = {
         "weights": {k: float(v) for k, v in w.items()},
