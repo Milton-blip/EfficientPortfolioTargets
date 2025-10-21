@@ -36,31 +36,55 @@ def _resolve_return_label(return_type_opt: Optional[str], returns_path: str) -> 
 def to_real_returns(returns_df: pd.DataFrame, inflation_col: Optional[str] = None) -> pd.DataFrame:
     """
     Convert sleeve returns to REAL using (1+r)/(1+pi) - 1 per period.
-    Expects returns_df columns: Date + sleeve columns, and an inflation column if available.
-    If inflation_col is None, will try to find one named 'Inflation' or 'CPI' (case-insensitive).
+
+    We support two inflation column formats:
+      1) Per-period inflation rate (e.g., 0.003 for ~0.3% m/m)
+      2) CPI index level (e.g., 298.3, 299.1, ...). We detect this and convert to rate via pct_change().
+
+    Args:
+        returns_df: DataFrame with Date + sleeve columns and, ideally, an inflation column.
+        inflation_col: Optional explicit column name for inflation or CPI. If None, auto-detect
+                       a column named 'Inflation' or 'CPI' (case-insensitive).
+
+    Returns:
+        A copy of returns_df with sleeve columns converted to real returns.
+        Raises SystemExit if real was requested but no usable inflation is found.
     """
     df = returns_df.copy()
-    cols = [c for c in df.columns if c.lower() not in {"date"}]
 
-    # Find inflation column if not specified
-    if inflation_col is None:
-        for cand in df.columns:
-            lc = cand.lower()
-            if lc in {"inflation", "cpi"}:
-                inflation_col = cand
+    # 1) Find inflation column
+    cand = None
+    if inflation_col and inflation_col in df.columns:
+        cand = inflation_col
+    else:
+        for c in df.columns:
+            if c.lower() in {"inflation", "cpi"}:
+                cand = c
                 break
 
-    if inflation_col is None or inflation_col not in df.columns:
-        print("[WARN] No inflation column found; Real returns cannot be computed. Using nominal returns.")
-        return df
+    if cand is None:
+        raise SystemExit(
+            "[ERROR] --return-type real was requested, but no inflation column was found. "
+            "Add a column named 'Inflation' or 'CPI', or pass --inflation-col <name>."
+        )
 
-    pi = pd.to_numeric(df[inflation_col], errors="coerce").fillna(0.0)
-    print(f"[INFO] Using inflation column '{inflation_col}'. "
-          f"Avg per-period inflation: {float(pi.mean())*100:.3f}%")
-    sleeve_cols = [c for c in df.columns if c not in {"Date", inflation_col}]
+    # 2) Build per-period inflation rate 'pi'
+    raw = pd.to_numeric(df[cand], errors="coerce")
+    # Heuristic: if values look like index levels (typical CPI ~ 100..400), derive rate via pct_change().
+    # If values look like small rates (~ -0.02 .. 0.05), use as-is.
+    if raw.abs().median() > 2.0:  # likely index levels
+        pi = raw.pct_change().fillna(0.0)
+        src = f"{cand} (index→rate via pct_change)"
+    else:
+        pi = raw.fillna(0.0)
+        src = f"{cand} (rate)"
 
+    print(f"[INFO] Using inflation from '{src}'. Avg per-period inflation: {float(pi.mean())*100:.3f}%")
+
+    # 3) Convert all sleeve columns (non-Date, non-inflation) to real
+    sleeve_cols = [c for c in df.columns if c not in {"Date", cand}]
     for c in sleeve_cols:
-        r = pd.to_numeric(df[c], errors="coerce")
+        r = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
         df[c] = (1.0 + r) / (1.0 + pi) - 1.0
 
     return df
@@ -544,7 +568,13 @@ def parse_args():
         "--return-type",
         choices=["nominal", "real"],
         default="nominal",
-        help="Used only for labeling charts: nominal or real.",
+        help="Compute/report either nominal or real returns.",
+    )
+    p.add_argument(
+        "--inflation-col",
+        default=None,
+        help="Name of the inflation/CPI column in returns CSV. If this column appears to be a CPI index level, "
+             "it will be converted to per-period inflation via pct_change(). If it's already a rate, it will be used as-is."
     )
     return p.parse_args()
 
@@ -568,14 +598,16 @@ def main():
 
     try:
         returns_df = load_returns(Path(args.returns_file))
-        # Convert to real returns if requested
         ret_label = _resolve_return_label(getattr(args, "return_type", None), args.returns_file)
         if ret_label == "Real":
-            returns_df = to_real_returns(returns_df, inflation_col=None)  # auto-detect 'Inflation'/'CPI'
+            # Use explicit column if provided; otherwise auto-detect ('Inflation' or 'CPI')
+            returns_df = to_real_returns(returns_df, inflation_col=args.inflation_col)
     except FileNotFoundError:
         if args.auto_regen:
             auto_generate_returns_if_needed(args, sleeves_in_holdings)
             returns_df = load_returns(Path(args.returns_file))
+            if ret_label == "Real":
+                returns_df = to_real_returns(returns_df, inflation_col=args.inflation_col)
         else:
             raise SystemExit(f"[ERROR] Could not find returns file. Expected at: {args.returns_file}")
 
