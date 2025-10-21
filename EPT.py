@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 
 
 # ----------------------------
-# Utilities
+# Paths
 # ----------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -20,6 +20,10 @@ DEFAULT_RETURNS = PROJECT_ROOT / "returns" / "sleeve_returns.csv"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 SLEEVE_MAP_CSV = PROJECT_ROOT / "portfolio_data" / "sleeve_map.csv"
 
+
+# ----------------------------
+# Utilities
+# ----------------------------
 
 def ensure_outputs_dir():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,7 +43,8 @@ def load_sleeve_map(csv_path: Path) -> pd.DataFrame:
     need = {"Symbol", "Sleeve"}
     have = {c.strip() for c in df.columns}
     if not need.issubset(have):
-        raise SystemExit(f"[ERROR] sleeve_map.csv missing columns: {sorted(need - have)}")
+        miss = sorted(need - have)
+        raise SystemExit(f"[ERROR] sleeve_map.csv missing columns: {miss}")
 
     df = df[[c for c in df.columns if c.strip() in need]].copy()
     df.columns = [c.strip() for c in df.columns]
@@ -57,11 +62,9 @@ def assign_sleeves(holdings: pd.DataFrame, sleeve_map: pd.DataFrame) -> pd.DataF
     out["Symbol"] = out["Symbol"].map(canon)
     out["Sleeve"] = out["Sleeve"].astype(str).map(canon)
 
-    # Fill missing sleeves from map
     sym2sleeve = dict(sleeve_map[["Symbol", "Sleeve"]].values)
     mask = (out["Sleeve"].eq("")) | (out["Sleeve"].str.lower().isin({"nan", "none"}))
     out.loc[mask, "Sleeve"] = out.loc[mask, "Symbol"].map(sym2sleeve).fillna("")
-
     return out
 
 
@@ -75,7 +78,7 @@ def load_returns(returns_csv: Path) -> pd.DataFrame:
 
 
 def compute_current_sleeve_weights(holdings: pd.DataFrame) -> pd.Series:
-    # Accept either MarketValue or Quantity*PricePerShare
+    # Use MarketValue if present; else Quantity * PricePerShare
     if "MarketValue" in holdings.columns:
         mv = pd.to_numeric(holdings["MarketValue"], errors="coerce").fillna(0.0)
     else:
@@ -94,14 +97,14 @@ def compute_current_sleeve_weights(holdings: pd.DataFrame) -> pd.Series:
 
 
 def align_and_build_stats(holdings_sleeves: pd.Series, returns_df: pd.DataFrame):
-    """Returns: mu (Series), cov (DataFrame), common_sleeves (Index)"""
+    """Return mu (Series), cov (DataFrame), common (Index)."""
     sleeves_hold = set(holdings_sleeves.index)
     ret_cols = [c for c in returns_df.columns if c != "Date"]
     sleeves_ret = set(ret_cols)
     common = sorted(sleeves_hold & sleeves_ret)
 
     if not common:
-        # Dump debug file so user can see why
+        ensure_outputs_dir()
         dbg = {
             "holdings_sleeves": sorted(sleeves_hold),
             "returns_sleeves": sorted(sleeves_ret),
@@ -113,7 +116,7 @@ def align_and_build_stats(holdings_sleeves: pd.Series, returns_df: pd.DataFrame)
         )
 
     R = returns_df[common].dropna().astype(float)
-    mu = R.mean() * 100.0  # mean period returns in %
+    mu = R.mean() * 100.0  # mean period returns in percent units
     cov = np.cov(R.values, rowvar=False)
     cov = pd.DataFrame(cov, index=common, columns=common)
     return mu, cov, pd.Index(common)
@@ -179,11 +182,10 @@ def print_results(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame, target_v
     print(f"Volatility %: {vol:.2f}")
     print(f"Sharpe: {sharpe:.2f}")
 
-    # mean period returns printout
     print("\nMean period returns by sleeve (%), descending:")
     print(mu.sort_values(ascending=False).round(3))
 
-    # Plot efficient frontier point (single point) for context
+    # simple figure for context
     ensure_outputs_dir()
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.scatter(vol, exp_ret, c="blue", label="Solution")
@@ -199,7 +201,7 @@ def print_results(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame, target_v
 
 
 def auto_generate_returns_if_needed(args, sleeves_in_holdings: list[str]) -> None:
-    """Generate returns if missing or if requested due to concentration."""
+    """Generate returns if missing."""
     ret_csv = Path(args.returns_file) if args.returns_file else DEFAULT_RETURNS
     need_gen = False
     reason = None
@@ -220,8 +222,13 @@ def auto_generate_returns_if_needed(args, sleeves_in_holdings: list[str]) -> Non
             subprocess.run(cmd, check=True, capture_output=True)
             print(f"[INFO] Auto-generated returns ({reason}): {ret_csv}")
         except subprocess.CalledProcessError as e:
-            print(e.stdout.decode(errors="ignore"))
-            print(e.stderr.decode(errors="ignore"))
+            try:
+                stdout = e.stdout.decode(errors="ignore")
+                stderr = e.stderr.decode(errors="ignore")
+                print(stdout)
+                print(stderr)
+            except Exception:
+                pass
             raise SystemExit("[ERROR] Failed to auto-generate returns.")
 
 
@@ -232,13 +239,15 @@ def auto_generate_returns_if_needed(args, sleeves_in_holdings: list[str]) -> Non
 def parse_args():
     p = argparse.ArgumentParser(description="EfficientPortfolioTargets optimizer")
     p.add_argument("--holdings", required=True, help="Path to holdings CSV.")
-    p.add_argument("--target-vol", type=float, required=True, help="Target volatility (e.g., 0.08 for 8%).")
+    # Avoid literal % in help strings (argparse uses printf-style formatting)
+    p.add_argument("--target-vol", type=float, required=True,
+                   help="Target volatility (example: 0.08 for 8 percent).")
     p.add_argument("--returns-file", default=str(DEFAULT_RETURNS), help="Path to returns CSV.")
     p.add_argument("--max-weight", type=float, default=None, help="Optional per-sleeve max weight (0–1).")
     p.add_argument("--min-weight", type=float, default=None, help="Optional per-sleeve min weight (0–1).")
     p.add_argument("--l2-to-current", type=float, default=None, help="Optional L2 penalty to current weights.")
     p.add_argument("--auto-regen", dest="auto_regen", action="store_true",
-                   help="If set, auto-generate returns when missing or when solution is overly concentrated.")
+                   help="Auto-generate returns when missing or when solution is overly concentrated.")
     return p.parse_args()
 
 
@@ -246,7 +255,7 @@ def main():
     ensure_outputs_dir()
     args = parse_args()
 
-    # Load holdings and assign sleeves dynamically from sleeve_map.csv
+    # Load holdings and sleeves
     if not Path(args.holdings).exists():
         raise SystemExit(f"[ERROR] Holdings file not found: {args.holdings}")
 
@@ -254,11 +263,11 @@ def main():
     sleeve_map = load_sleeve_map(SLEEVE_MAP_CSV)
     holdings = assign_sleeves(holdings_raw, sleeve_map)
 
-    # Compute current sleeve weights (for optional L2 anchoring)
+    # Current sleeve weights
     current_w = compute_current_sleeve_weights(holdings)
     sleeves_in_holdings = current_w.index.tolist()
 
-    # Auto-generate returns if missing
+    # Auto-generate returns if needed
     auto_generate_returns_if_needed(args, sleeves_in_holdings)
 
     # Load returns and align
@@ -272,11 +281,9 @@ def main():
             raise SystemExit(f"[ERROR] Could not find returns file. Expected at: {args.returns_file}")
 
     mu, cov, common = align_and_build_stats(current_w, returns_df)
-
-    # Reindex current weights to common sleeves (fill missing with 0)
     current_w = current_w.reindex(common).fillna(0.0)
 
-    # Solve optimization
+    # Optimize
     w = solve_max_return_at_vol(
         mu=mu.reindex(common),
         cov=cov.reindex(index=common, columns=common),
@@ -287,7 +294,7 @@ def main():
         current_w=current_w if args.l2_to_current is not None else None,
     )
 
-    # If overly concentrated and --auto-regen, regenerate and re-run once
+    # If overly concentrated and requested, regenerate and retry once
     if args.auto_regen and float(w.max()) >= 0.98:
         print("[INFO] Solution overly concentrated; regenerating returns for better diversification...")
         auto_generate_returns_if_needed(args, sleeves_in_holdings)
@@ -306,7 +313,7 @@ def main():
 
     print_results(w, mu.reindex(w.index), cov.reindex(index=w.index, columns=w.index), args.target_vol)
 
-    # Save a JSON snapshot
+    # Save snapshot
     snapshot = {
         "weights": {k: float(v) for k, v in w.items()},
         "target_vol": float(args.target_vol),
