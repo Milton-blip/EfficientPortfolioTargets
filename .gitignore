@@ -25,3 +25,4 @@ old_output/
 __pycache__/
 *.pycold_files/
 *.csv
+PA2.py.local.*
