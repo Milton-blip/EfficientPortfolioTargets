@@ -337,7 +337,7 @@ def parse_args():
     )
     p.add_argument("--holdings", required=True, help="Path to holdings CSV.")
     p.add_argument("--returns-file", default=str(RETURNS_DEFAULT), help="Path to sleeve_returns.csv.")
-    p.add_argument("--target-vol", type=float, required=True, help="Target volatility (e.g., 0.08 for 8%).")
+    p.add_argument("--target-vol", type=float, required=True, help="Target volatility (e.g., 0.08 for 8%%).")
     p.add_argument("--max-weight", type=float, default=None, help="Per-sleeve max weight (e.g., 0.35).")
     p.add_argument("--min-weight", type=float, default=None, help="Per-sleeve min weight (e.g., 0.00).")
     p.add_argument("--l2-to-current", type=float, default=0.0, help="(Not used in frontier solve; reserved.)")
