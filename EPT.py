@@ -25,6 +25,13 @@ def _infer_returns_label(returns_path: str) -> str:
         return "Nominal"
     return "Nominal"
 
+def _resolve_return_label(return_type_opt: Optional[str], returns_path: str) -> str:
+    """
+    Prefer the --return-type flag; fall back to inferring from path.
+    """
+    if return_type_opt:
+        return "Real" if return_type_opt.lower() == "real" else "Nominal"
+    return _infer_returns_label(returns_path)
 
 def plot_frontier_pretty(
     returns_path,
@@ -40,6 +47,7 @@ def plot_frontier_pretty(
     vol_maxsharpe=None,
     scenario_name="Base",
     outputs_dir="outputs",
+    label_override=None,  # <-- NEW
 ):
     """
     Produce a frontier chart. All inputs here are in DECIMALS (0.08 = 8%).
@@ -48,7 +56,7 @@ def plot_frontier_pretty(
     from pathlib import Path
 
     Path(outputs_dir).mkdir(parents=True, exist_ok=True)
-    label_nv = _infer_returns_label(returns_path)
+    label_nv = label_override or _infer_returns_label(returns_path)
 
     plt.figure(figsize=(9.5, 5.6), dpi=140)
 
@@ -58,7 +66,7 @@ def plot_frontier_pretty(
         [r * 100 for r in frontier_rets],
         color="#0b245b",
         linewidth=3.0,
-        label="Frontier",
+        label=f"Frontier ({label_nv})",
     )
 
     # Target vol point
@@ -235,6 +243,19 @@ def align_and_build_stats(holdings_w: pd.Series, returns_df: pd.DataFrame):
     cov = pd.DataFrame(cov, index=common, columns=common)
     return mu, cov, pd.Index(common)
 
+def _solve_with_robust_settings(prob: cp.Problem) -> None:
+    # Try ECOS (QP) with tighter tolerances, then OSQP, then SCS.
+    try:
+        prob.solve(solver=cp.ECOS, verbose=False, max_iters=10000, abstol=1e-9, reltol=1e-9, feastol=1e-9)
+    except Exception:
+        pass
+    if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or prob.value is None:
+        try:
+            prob.solve(solver=cp.OSQP, eps_abs=1e-8, eps_rel=1e-8, max_iter=200000, polish=True, verbose=False)
+        except Exception:
+            pass
+    if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or prob.value is None:
+        prob.solve(solver=cp.SCS, verbose=False, max_iters=200000, eps=1e-7)
 
 def solve_max_return_at_vol(
     mu: pd.Series,
@@ -265,9 +286,7 @@ def solve_max_return_at_vol(
     if l2_to_current is not None and current_w is not None and len(current_w) == n:
         obj = cp.Maximize(expected_ret - l2_to_current * cp.sum_squares(w - current_w.values))
     prob = cp.Problem(obj, cons)
-    prob.solve(solver=cp.SCS, verbose=False, max_iters=20000)
-    if w.value is None:
-        prob.solve(solver=cp.ECOS, verbose=False, max_iters=20000)
+    _solve_with_robust_settings(prob)
     if w.value is None:
         raise SystemExit("[ERROR] Optimization failed to converge with available solvers.")
     sol = pd.Series(np.clip(w.value, 0, None), index=sleeves)
@@ -289,11 +308,9 @@ def solve_min_variance(
         cons.append(w >= min_weight)
     obj = cp.Minimize(cp.quad_form(w, cov_mat))
     prob = cp.Problem(obj, cons)
-    prob.solve(solver=cp.SCS, verbose=False, max_iters=20000)
+    _solve_with_robust_settings(prob)
     if w.value is None:
-        prob.solve(solver=cp.ECOS, verbose=False, max_iters=20000)
-    if w.value is None:
-        raise SystemExit("[ERROR] Min-variance solve failed.")
+        raise SystemExit("[ERROR] Optimization failed to converge with available solvers.")
     s = pd.Series(np.clip(w.value, 0, None), index=cov.index)
     return s / s.sum()
 
@@ -316,11 +333,9 @@ def solve_max_sharpe(
         cons.append(w >= min_weight)
     obj = cp.Maximize(mu_vec @ w)
     prob = cp.Problem(obj, cons)
-    prob.solve(solver=cp.SCS, verbose=False, max_iters=20000)
+    _solve_with_robust_settings(prob)
     if w.value is None:
-        prob.solve(solver=cp.ECOS, verbose=False, max_iters=20000)
-    if w.value is None:
-        raise SystemExit("[ERROR] Max-Sharpe solve failed.")
+        raise SystemExit("[ERROR] Optimization failed to converge with available solvers.")
     s = pd.Series(np.clip(w.value, 0, None), index=mu.index)
     return s / s.sum()
 
@@ -371,7 +386,7 @@ def plot_frontier(
 
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     if vols and rets:
-        ax.plot(vols, rets, color="navy", lw=2.0, label="Frontier")
+        ax.plot(vols, rets, color="navy", lw=2.0, label=f"Frontier ({ret_type_label})")
 
     ax.scatter([t_v], [t_r], s=80, edgecolors="black", facecolors="gold", label="Target 8 percent Vol")
     ax.scatter([ms_v], [ms_r], s=40, color="green", label="MaxSharpe")
@@ -391,15 +406,15 @@ def plot_frontier(
     print(f"Saved frontier figure: {out_png}")
 
 
-def print_results(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame, target_vol: float):
+def print_results(weights: pd.Series, mu: pd.Series, cov: pd.DataFrame, target_vol: float, ret_label: str):
     df = pd.DataFrame({"Weight%": (weights * 100.0).round(2)}).sort_values("Weight%", ascending=False)
     print("\nWeights (%):")
     print(df.to_string())
     r, v, s = realized_stats(weights, mu, cov)
-    print(f"\nExpected Return %: {r:.2f}")
+    print(f"\nExpected Return % ({ret_label}): {r:.2f}")
     print(f"Volatility %: {v:.2f}")
-    print(f"Sharpe: {s:.2f}")
-    print("\nMean period returns by sleeve (%), descending:")
+    print(f"Sharpe ({ret_label}): {s:.2f}")
+    print("\nMean period returns by sleeve (% " + ret_label + "), descending:")
     print(mu.sort_values(ascending=False).round(3))
 
 
@@ -463,6 +478,8 @@ def main():
     ensure_outputs_dir()
     args = parse_args()
 
+    ret_label = _resolve_return_label(getattr(args, "return_type", None), args.returns_file)
+
     if not Path(args.holdings).exists():
         raise SystemExit(f"[ERROR] Holdings file not found: {args.holdings}")
 
@@ -512,23 +529,35 @@ def main():
             current_w=current_w if args.l2_to_current is not None else None,
         )
 
-    print_results(w, mu.reindex(w.index), cov.reindex(index=w.index, columns=w.index), args.target_vol)
+    print_results(w, mu.reindex(w.index), cov.reindex(index=w.index, columns=w.index), args.target_vol, ret_label)
 
     # --- build frontier grid and key points for pretty plot (DECIMAL inputs for pretty plot) ---
     vols_on_grid, rets_on_grid = [], []
     grid = np.linspace(
-        max(0.0025, 0.5 * float(args.target_vol)),
-        max(float(args.target_vol) * 1.8, float(args.target_vol) + 0.03),
-        40,
+        max(0.0025, 0.35 * float(args.target_vol)),
+        max(float(args.target_vol) * 2.0, float(args.target_vol) + 0.05),
+        100,  # denser grid for smoother curve
     )
+
+    pts = []
     for tv in grid:
         try:
             w_tv = solve_max_return_at_vol(mu, cov, tv)
-            r_tv, v_tv, _ = realized_stats(w_tv, mu, cov)  # percent
-            rets_on_grid.append(r_tv / 100.0)             # decimal for pretty
-            vols_on_grid.append(v_tv / 100.0)             # decimal for pretty
+            r_tv, v_tv, _ = realized_stats(w_tv, mu, cov)  # percent units
+            pts.append((v_tv, r_tv))  # store as (vol%, ret%)
         except Exception:
             pass
+
+    if pts:
+        df_front = pd.DataFrame(pts, columns=["vol_pct", "ret_pct"]).dropna()
+        df_front = df_front.sort_values("vol_pct").drop_duplicates(subset=["vol_pct"], keep="last")
+        # enforce convex-looking, nondecreasing frontier: upper envelope
+        df_front["ret_pct"] = df_front["ret_pct"].cummax()
+        # convert to decimals for plotting function
+        vols_on_grid = (df_front["vol_pct"] / 100.0).tolist()
+        rets_on_grid = (df_front["ret_pct"] / 100.0).tolist()
+    else:
+        vols_on_grid, rets_on_grid = [], []
 
     # Key points (percent from realized_stats → convert to decimals for pretty plot)
     w_min = solve_min_variance(cov)
@@ -557,6 +586,7 @@ def main():
         vol_maxsharpe=vol_maxsharpe / 100.0,
         scenario_name="Base",
         outputs_dir=str(OUTPUT_DIR),
+        label_override=ret_label,  # <-- NEW
     )
     print(f"Saved efficient frontier chart: {png_path}")
 
@@ -564,6 +594,7 @@ def main():
         "weights": {k: float(v) for k, v in w.items()},
         "target_vol": float(args.target_vol),
         "mu_percent": {k: float(v) for k, v in mu.reindex(w.index).items()},
+        "return_label": ret_label,
     }
     (OUTPUT_DIR / "ept_last_run.json").write_text(json.dumps(snapshot, indent=2))
     print(f"Saved run snapshot: {OUTPUT_DIR / 'ept_last_run.json'}")
